@@ -1,0 +1,33 @@
+{
+  "source_dir": "D:\\Video-Review-Tool\\分镜生成",
+  "pass_dir": "D:\\Video-Review-Tool\\审核通过",
+  "fail_dir": "D:\\Video-Review-Tool\\不合格视频",
+  "logo_path": "D:\\Video-Review-Tool\\app_logo.png",
+  "shortcuts": {
+    "pass": "V",
+    "fail": "N",
+    "previous": "Y",
+    "end": "E",
+    "pause": "Space",
+    "trim_in": "I",
+    "trim_out": "O"
+  },
+  "splitter_sizes": {
+    "body_horizontal": [
+      280,
+      980,
+      280
+    ],
+    "center_vertical": [
+      720,
+      150
+    ]
+  },
+  "waveform_visible": true,
+  "window_geometry": {
+    "x": 530,
+    "y": 205,
+    "width": 1500,
+    "height": 920
+  }
+}

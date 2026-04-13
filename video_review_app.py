@@ -1,14 +1,16 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QPointF, QSize, QThread, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QThread, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -39,8 +41,10 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv", ".flv", ".we
 SOURCE_DIR_NAME = "分镜生成"
 PASS_DIR_NAME = "审核通过"
 FAIL_DIR_NAME = "不合格视频"
+PRODUCT_LIBRARY_DIR_NAME = "产品库"
 CONFIG_FILE_NAME = "review_config.json"
 LOGO_FILE_NAME = "app_logo.png"
+REFERENCE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
 DEFAULT_SHORTCUTS = {
     "pass": "V",
@@ -50,18 +54,16 @@ DEFAULT_SHORTCUTS = {
     "pause": "Space",
     "trim_in": "I",
     "trim_out": "O",
+    "cycle_reference": "Z",
 }
 
-DEFAULT_SPLITTER_SIZES = {
-    "body_horizontal": [280, 980, 280],
-    "center_vertical": [720, 150],
-}
 
-MIN_LEFT_PANEL_WIDTH = 160
-MIN_RIGHT_PANEL_WIDTH = 220
-MIN_VIDEO_HEIGHT = 240
-MIN_TIMELINE_HEIGHT = 108
-MIN_TIMELINE_HEIGHT_COLLAPSED = 44
+def get_ffmpeg_exe() -> str:
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
 
 
 @dataclass
@@ -80,7 +82,7 @@ class WaveformWidget(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(88)
+        self.setMinimumHeight(92)
         self.peaks: Optional[list[float]] = None
         self.playhead_fraction = 0.0
         self.in_fraction: Optional[float] = None
@@ -115,7 +117,7 @@ class WaveformWidget(QWidget):
         self.update()
 
     def _fraction_from_x(self, x: int) -> float:
-        rect = self.rect().adjusted(8, 8, -8, -8)
+        rect = self.rect().adjusted(1, 1, -1, -1)
         if rect.width() <= 1:
             return 0.0
         return max(0.0, min(1.0, (x - rect.left()) / rect.width()))
@@ -138,13 +140,8 @@ class WaveformWidget(QWidget):
         painter.setPen(QPen(Qt.GlobalColor.lightGray, 1))
         painter.drawRect(rect)
 
-        inner = rect.adjusted(8, 8, -8, -8)
+        inner = rect.adjusted(6, 6, -6, -6)
         if inner.width() <= 0 or inner.height() <= 0:
-            return
-
-        if self.peaks is None:
-            painter.setPen(QPen(Qt.GlobalColor.darkGray, 1))
-            painter.drawText(inner, Qt.AlignmentFlag.AlignCenter, self.status_text)
             return
 
         if self.in_fraction is not None and self.out_fraction is not None and self.out_fraction > self.in_fraction:
@@ -152,9 +149,14 @@ class WaveformWidget(QWidget):
             end_x = inner.left() + int(self.out_fraction * inner.width())
             painter.fillRect(start_x, inner.top(), max(1, end_x - start_x), inner.height(), Qt.GlobalColor.cyan)
 
+        if self.peaks is None:
+            painter.setPen(QPen(Qt.GlobalColor.darkGray, 1))
+            painter.drawText(inner, Qt.AlignmentFlag.AlignCenter, self.status_text)
+            return
+
         if not self.peaks:
             painter.setPen(QPen(Qt.GlobalColor.darkGray, 1))
-            painter.drawText(inner, Qt.AlignmentFlag.AlignCenter, self.status_text or "当前视频没有可显示的音频")
+            painter.drawText(inner, Qt.AlignmentFlag.AlignCenter, self.status_text or "当前视频没有音频波形")
             return
 
         count = len(self.peaks)
@@ -162,7 +164,7 @@ class WaveformWidget(QWidget):
         height = max(1, inner.height())
         center_y = inner.top() + height / 2
         played_index = int(self.playhead_fraction * max(1, count - 1))
-        pen_width = max(1, int(width / max(1, count) + 0.45))
+        pen_width = max(1, int(width / max(1, count) + 0.4))
         played_pen = QPen(Qt.GlobalColor.darkCyan, pen_width)
         future_pen = QPen(Qt.GlobalColor.gray, pen_width)
 
@@ -202,47 +204,6 @@ class WaveformThread(QThread):
             self.finished_waveform.emit(str(self.video_path), [], str(exc))
 
 
-def build_eye_icon(visible: bool, size: int = 18) -> QIcon:
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-    pen = QPen(QColor("#4b5563"), 1.8)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    painter.setPen(pen)
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-
-    left = 2.0
-    top = 4.0
-    right = size - 2.0
-    bottom = size - 4.0
-    mid_x = size / 2.0
-    mid_y = size / 2.0
-
-    path = QPainterPath()
-    path.moveTo(left, mid_y)
-    path.quadTo(mid_x, top, right, mid_y)
-    path.quadTo(mid_x, bottom, left, mid_y)
-    path.closeSubpath()
-    painter.drawPath(path)
-
-    pupil_radius = max(2.0, size * 0.12)
-    if visible:
-        painter.setBrush(QColor("#4b5563"))
-        painter.drawEllipse(QPointF(mid_x, mid_y), pupil_radius, pupil_radius)
-    else:
-        painter.drawEllipse(QPointF(mid_x, mid_y), pupil_radius * 0.8, pupil_radius * 0.8)
-        slash_pen = QPen(QColor("#ef4444"), 1.9)
-        slash_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(slash_pen)
-        painter.drawLine(int(size * 0.24), int(size * 0.8), int(size * 0.78), int(size * 0.22))
-
-    painter.end()
-    return QIcon(pixmap)
-
-
 class SettingsDialog(QDialog):
     def __init__(
         self,
@@ -251,27 +212,31 @@ class SettingsDialog(QDialog):
         source_dir: Path,
         pass_dir: Path,
         fail_dir: Path,
+        product_library_dir: Path,
         shortcuts: dict[str, str],
         logo_path: Optional[Path],
     ) -> None:
         super().__init__(parent)
         self.base_dir = base_dir
         self.setWindowTitle("设置")
-        self.resize(880, 460)
+        self.resize(860, 420)
 
         root = QVBoxLayout(self)
         form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         form.setHorizontalSpacing(16)
         form.setVerticalSpacing(12)
 
         self.source_edit, source_row = self._build_path_row(str(source_dir))
         self.pass_edit, pass_row = self._build_path_row(str(pass_dir))
         self.fail_edit, fail_row = self._build_path_row(str(fail_dir))
+        self.product_library_edit, product_library_row = self._build_path_row(str(product_library_dir))
         self.logo_edit, logo_row = self._build_file_row(str(logo_path) if logo_path else "")
 
         form.addRow("源文件目录", source_row)
         form.addRow("通过目录", pass_row)
         form.addRow("不通过目录", fail_row)
+        form.addRow("产品库目录", product_library_row)
         form.addRow("Logo 图片", logo_row)
 
         shortcut_widget = QWidget()
@@ -287,6 +252,7 @@ class SettingsDialog(QDialog):
         self.pause_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("pause", DEFAULT_SHORTCUTS["pause"])))
         self.trim_in_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("trim_in", DEFAULT_SHORTCUTS["trim_in"])))
         self.trim_out_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("trim_out", DEFAULT_SHORTCUTS["trim_out"])))
+        self.cycle_reference_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("cycle_reference", DEFAULT_SHORTCUTS["cycle_reference"])))
 
         shortcut_layout.addWidget(QLabel("通过"), 0, 0)
         shortcut_layout.addWidget(self.pass_key_edit, 0, 1)
@@ -302,29 +268,28 @@ class SettingsDialog(QDialog):
         shortcut_layout.addWidget(self.trim_in_key_edit, 2, 3)
         shortcut_layout.addWidget(QLabel("终点 O"), 3, 0)
         shortcut_layout.addWidget(self.trim_out_key_edit, 3, 1)
+        shortcut_layout.addWidget(QLabel("切换参考图"), 3, 2)
+        shortcut_layout.addWidget(self.cycle_reference_key_edit, 3, 3)
 
         form.addRow("快捷键", shortcut_widget)
         root.addLayout(form)
 
-        tip = QLabel("I：设置裁剪起点；O：将 I 到 O 的区间直接裁剪到通过目录。若未设置 I，则默认从 0 秒裁到 O。")
+        tip = QLabel("I：设置裁剪起点；O：把 I 到 O 的区间直接裁剪到通过目录。若未设置 I，则默认从 0 秒裁到 O。Z：切换当前产品参考图，切换后会记住。拖动时间条时会自动暂停并显示该帧。")
         tip.setWordWrap(True)
-        tip.setStyleSheet("color:#666;")
+        tip.setStyleSheet("color: #666;")
         root.addWidget(tip)
 
         btn_row = QHBoxLayout()
-        layout_reset_btn = QPushButton("重置布局比例")
-        btn_row.addWidget(layout_reset_btn)
         btn_row.addStretch(1)
-        reset_btn = QPushButton("恢复默认")
-        cancel_btn = QPushButton("取消")
-        save_btn = QPushButton("保存")
-        layout_reset_btn.clicked.connect(self.reset_layout_from_dialog)
-        reset_btn.clicked.connect(self.reset_defaults)
-        cancel_btn.clicked.connect(self.reject)
-        save_btn.clicked.connect(self.validate_and_accept)
-        btn_row.addWidget(reset_btn)
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(save_btn)
+        self.reset_button = QPushButton("恢复默认")
+        self.cancel_button = QPushButton("取消")
+        self.save_button = QPushButton("保存")
+        self.reset_button.clicked.connect(self.reset_defaults)
+        self.cancel_button.clicked.connect(self.reject)
+        self.save_button.clicked.connect(self.validate_and_accept)
+        btn_row.addWidget(self.reset_button)
+        btn_row.addWidget(self.cancel_button)
+        btn_row.addWidget(self.save_button)
         root.addLayout(btn_row)
 
     def _build_path_row(self, value: str) -> tuple[QLineEdit, QWidget]:
@@ -372,6 +337,7 @@ class SettingsDialog(QDialog):
         self.source_edit.setText(str(self.base_dir / SOURCE_DIR_NAME))
         self.pass_edit.setText(str(self.base_dir / PASS_DIR_NAME))
         self.fail_edit.setText(str(self.base_dir / FAIL_DIR_NAME))
+        self.product_library_edit.setText(str(self.base_dir / PRODUCT_LIBRARY_DIR_NAME))
         self.logo_edit.setText(str(self.base_dir / LOGO_FILE_NAME))
         self.pass_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["pass"]))
         self.fail_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["fail"]))
@@ -380,29 +346,14 @@ class SettingsDialog(QDialog):
         self.pause_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["pause"]))
         self.trim_in_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["trim_in"]))
         self.trim_out_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["trim_out"]))
-
-    def reset_layout_from_dialog(self) -> None:
-        parent = self.parent()
-        if parent is None or not hasattr(parent, "reset_layout_proportions"):
-            QMessageBox.information(self, "重置布局", "当前窗口不支持布局重置。")
-            return
-        reply = QMessageBox.question(
-            self,
-            "重置布局比例",
-            "将左侧、视频区、底部时间轴、右侧记录区恢复为默认比例。是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        parent.reset_layout_proportions()
-        QMessageBox.information(self, "重置布局", "布局比例已恢复默认，并已自动保存。")
+        self.cycle_reference_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["cycle_reference"]))
 
     def get_values(self) -> dict:
         return {
             "source_dir": self.source_edit.text().strip(),
             "pass_dir": self.pass_edit.text().strip(),
             "fail_dir": self.fail_edit.text().strip(),
+            "product_library_dir": self.product_library_edit.text().strip(),
             "logo_path": self.logo_edit.text().strip(),
             "shortcuts": {
                 "pass": self.pass_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
@@ -412,13 +363,14 @@ class SettingsDialog(QDialog):
                 "pause": self.pause_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
                 "trim_in": self.trim_in_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
                 "trim_out": self.trim_out_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
+                "cycle_reference": self.cycle_reference_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
             },
         }
 
     def validate_and_accept(self) -> None:
         values = self.get_values()
-        if any(not values[key] for key in ("source_dir", "pass_dir", "fail_dir")):
-            QMessageBox.warning(self, "设置无效", "源文件目录、通过目录、不通过目录都不能为空。")
+        if any(not values[key] for key in ("source_dir", "pass_dir", "fail_dir", "product_library_dir")):
+            QMessageBox.warning(self, "设置无效", "源文件目录、通过目录、不通过目录、产品库目录都不能为空。")
             return
 
         shortcut_values = values["shortcuts"]
@@ -435,11 +387,16 @@ class SettingsDialog(QDialog):
             "pause": "暂停/继续",
             "trim_in": "起点 I",
             "trim_out": "终点 O",
+            "cycle_reference": "切换参考图",
         }
         for key, value in shortcut_values.items():
             normalized = value.upper()
             if normalized in seen:
-                QMessageBox.warning(self, "快捷键冲突", f"“{labels[key]}” 与 “{labels[seen[normalized]]}” 使用了相同快捷键：{value}")
+                QMessageBox.warning(
+                    self,
+                    "快捷键冲突",
+                    f"“{labels[key]}” 与 “{labels[seen[normalized]]}” 使用了相同快捷键：{value}",
+                )
                 return
             seen[normalized] = key
 
@@ -456,276 +413,232 @@ class ReviewWindow(QMainWindow):
         self.source_dir = self.base_dir / SOURCE_DIR_NAME
         self.pass_dir = self.base_dir / PASS_DIR_NAME
         self.fail_dir = self.base_dir / FAIL_DIR_NAME
+        self.product_library_dir = self.base_dir / PRODUCT_LIBRARY_DIR_NAME
         self.logo_path: Optional[Path] = None
         self.shortcuts_map = DEFAULT_SHORTCUTS.copy()
-        self.splitter_sizes = json.loads(json.dumps(DEFAULT_SPLITTER_SIZES))
-        self.waveform_visible = True
+        self.reference_selection_map: dict[str, str] = {}
+        self.reference_library_images: list[Path] = []
+        self.current_reference_product_key: Optional[str] = None
+        self.current_reference_display_name = ""
+        self.current_reference_images: list[Path] = []
+        self.current_reference_index = -1
+        self.reference_image_original_pixmap: Optional[QPixmap] = None
 
         self.items: list[VideoItem] = []
         self.current_index = -1
         self.review_active = False
         self.moved_after_finish = False
-        self.is_slider_dragging = False
-        self.was_playing_before_drag = False
+
+        self.current_trim_in_ms: Optional[int] = None
+        self.current_trim_out_ms: Optional[int] = None
+        self.user_dragging_slider = False
         self.waveform_thread: Optional[WaveformThread] = None
         self.waveform_request_path: Optional[str] = None
+
         self.shortcut_objects: dict[str, QShortcut] = {}
 
         self._load_config()
 
         self.setWindowTitle("视频审核工具")
-        self.resize(1500, 920)
+        self.setMinimumSize(820, 560)
+        self._resize_for_screen()
         self._apply_logo()
         self._build_ui()
         self._build_player()
         self._bind_shortcuts()
         self.refresh_settings_display()
-        self._restore_splitter_sizes()
         self._load_videos()
 
-    def _load_config(self) -> None:
-        if not self.config_path.exists():
-            self.logo_path = self._default_logo_path()
+    def _resize_for_screen(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(1280, 820)
             return
-        try:
-            data = json.loads(self.config_path.read_text(encoding="utf-8"))
-        except Exception:
-            self.logo_path = self._default_logo_path()
-            return
-
-        self.source_dir = self._resolve_saved_path(data.get("source_dir"), self.base_dir / SOURCE_DIR_NAME)
-        self.pass_dir = self._resolve_saved_path(data.get("pass_dir"), self.base_dir / PASS_DIR_NAME)
-        self.fail_dir = self._resolve_saved_path(data.get("fail_dir"), self.base_dir / FAIL_DIR_NAME)
-        self.logo_path = self._resolve_saved_path(data.get("logo_path"), self._default_logo_path())
-        self.shortcuts_map = DEFAULT_SHORTCUTS | data.get("shortcuts", {})
-        saved_splitters = data.get("splitter_sizes", {})
-        for key, default_value in DEFAULT_SPLITTER_SIZES.items():
-            raw_value = saved_splitters.get(key, default_value)
-            if isinstance(raw_value, list) and all(isinstance(x, int) and x > 0 for x in raw_value):
-                self.splitter_sizes[key] = raw_value
-        self.waveform_visible = bool(data.get("waveform_visible", True))
-        geometry = data.get("window_geometry")
-        if isinstance(geometry, dict):
-            x = geometry.get("x")
-            y = geometry.get("y")
-            w = geometry.get("width")
-            h = geometry.get("height")
-            if all(isinstance(v, int) for v in (x, y, w, h)):
-                self.setGeometry(x, y, max(900, w), max(640, h))
-
-    def save_config(self) -> None:
-        data = {
-            "source_dir": str(self.source_dir),
-            "pass_dir": str(self.pass_dir),
-            "fail_dir": str(self.fail_dir),
-            "logo_path": str(self.logo_path) if self.logo_path else "",
-            "shortcuts": self.shortcuts_map,
-            "splitter_sizes": self.splitter_sizes,
-            "waveform_visible": self.waveform_visible,
-            "window_geometry": {
-                "x": self.x(),
-                "y": self.y(),
-                "width": self.width(),
-                "height": self.height(),
-            },
-        }
-        try:
-            self.config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
-    def _resolve_saved_path(self, raw_value: Optional[str], fallback: Path) -> Path:
-        if not raw_value:
-            return fallback
-        path = Path(raw_value)
-        if path.is_absolute():
-            return path
-        return (self.base_dir / path).resolve()
-
-    def _default_logo_path(self) -> Optional[Path]:
-        candidates = [self.base_dir / LOGO_FILE_NAME, self.resource_dir / LOGO_FILE_NAME]
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-        return None
-
-    def _apply_logo(self) -> None:
-        if self.logo_path and self.logo_path.exists():
-            self.setWindowIcon(QIcon(str(self.logo_path)))
+        available = screen.availableGeometry()
+        width = max(980, min(available.width() - 60, 1400))
+        height = max(620, min(available.height() - 80, 900))
+        self.resize(width, height)
 
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
+
         page = QVBoxLayout(central)
-        page.setContentsMargins(8, 8, 8, 8)
-        page.setSpacing(6)
+        page.setContentsMargins(10, 10, 10, 10)
+        page.setSpacing(10)
 
-        self.header_region = self._build_header_region()
-        self.header_region.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        page.addWidget(self.header_region)
-
-        self.body_horizontal_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.body_horizontal_splitter.setChildrenCollapsible(False)
-        self.body_horizontal_splitter.setHandleWidth(8)
-        self.body_horizontal_splitter.splitterMoved.connect(lambda *_: self._remember_splitter_sizes("body_horizontal", self.body_horizontal_splitter))
-        page.addWidget(self.body_horizontal_splitter, 1)
-
-        self.left_region = self._build_left_region()
-        self.left_region.setMinimumWidth(MIN_LEFT_PANEL_WIDTH)
-        self.body_horizontal_splitter.addWidget(self.left_region)
-
-        self.center_vertical_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.center_vertical_splitter.setChildrenCollapsible(False)
-        self.center_vertical_splitter.setHandleWidth(8)
-        self.center_vertical_splitter.splitterMoved.connect(lambda *_: self._remember_splitter_sizes("center_vertical", self.center_vertical_splitter))
-        self.body_horizontal_splitter.addWidget(self.center_vertical_splitter)
-
-        self.video_region = self._build_video_region()
-        self.video_region.setMinimumHeight(MIN_VIDEO_HEIGHT)
-        self.center_vertical_splitter.addWidget(self.video_region)
-
-        self.timeline_region = self._build_timeline_region()
-        self.timeline_region.setMinimumHeight(MIN_TIMELINE_HEIGHT)
-        self.center_vertical_splitter.addWidget(self.timeline_region)
-
-        self.right_region = self._build_right_region()
-        self.right_region.setMinimumWidth(MIN_RIGHT_PANEL_WIDTH)
-        self.body_horizontal_splitter.addWidget(self.right_region)
-
-        self.body_horizontal_splitter.setStretchFactor(0, 0)
-        self.body_horizontal_splitter.setStretchFactor(1, 1)
-        self.body_horizontal_splitter.setStretchFactor(2, 0)
-        self.center_vertical_splitter.setStretchFactor(0, 1)
-        self.center_vertical_splitter.setStretchFactor(1, 0)
-
-        self.setStatusBar(QStatusBar())
-        self._build_menu()
-
-    def _build_header_region(self) -> QWidget:
-        box = QWidget()
-        box.setFixedHeight(42)
-        layout = QHBoxLayout(box)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-
+        top_bar = QHBoxLayout()
         self.btn_settings = QPushButton("设置")
-        self.btn_settings.setFixedHeight(32)
-        self.btn_settings.setMinimumWidth(64)
+        self.btn_settings.setFixedHeight(36)
         self.btn_settings.clicked.connect(self.open_settings_dialog)
+        self.btn_open_dir = QPushButton("打开程序目录")
+        self.btn_open_dir.setFixedHeight(36)
+        self.btn_open_dir.clicked.connect(self.open_base_dir)
 
-        layout.addWidget(self.btn_settings, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        layout.addStretch(1)
-        return box
+        self.logo_preview = QLabel()
+        self.logo_preview.setFixedSize(56, 56)
+        self.logo_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.logo_preview.setStyleSheet("border:1px solid #ddd;border-radius:10px;background:#fafafa;")
 
-    def _build_left_region(self) -> QWidget:
-        box = QWidget()
-        layout = QVBoxLayout(box)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        title_box = QVBoxLayout()
+        title_box.setContentsMargins(0, 0, 0, 0)
+        title_box.setSpacing(2)
+        title = QLabel("视频审核工具")
+        title.setStyleSheet("font-size: 22px; font-weight: 800;")
+        subtitle = QLabel("支持目录设置、快捷键审核、拖动时间条看帧、I/O 裁剪通过")
+        subtitle.setStyleSheet("color:#666;")
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
 
-        title = QLabel("待审核队列")
-        title.setStyleSheet("font-size:18px; font-weight:700;")
-        self.summary_label = QLabel("未开始")
-        self.summary_label.setWordWrap(True)
+        top_bar.addWidget(self.btn_settings)
+        top_bar.addWidget(self.btn_open_dir)
+        top_bar.addWidget(self.logo_preview)
+        top_bar.addLayout(title_box, 1)
+        self._update_logo_preview()
+        page.addLayout(top_bar)
+
+        root_splitter = QSplitter(Qt.Orientation.Horizontal)
+        root_splitter.setChildrenCollapsible(False)
+        root_splitter.setHandleWidth(8)
+
+        left_panel = QVBoxLayout()
+        left_title = QLabel("待审核队列")
+        left_title.setStyleSheet("font-size:18px; font-weight:700;")
         self.queue_list = QListWidget()
-        self.queue_list.setMinimumWidth(MIN_LEFT_PANEL_WIDTH - 16)
         self.queue_list.setAlternatingRowColors(True)
         self.queue_list.itemDoubleClicked.connect(self.jump_to_item)
+        self.summary_label = QLabel("未开始")
+        self.summary_label.setWordWrap(True)
+        left_panel.addWidget(left_title)
+        left_panel.addWidget(self.summary_label)
+        left_panel.addWidget(self.queue_list, 1)
+        left_container = QWidget()
+        left_container.setLayout(left_panel)
+        left_container.setMinimumWidth(200)
+        left_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
-        layout.addWidget(title)
-        layout.addWidget(self.summary_label)
-        layout.addWidget(self.queue_list, 1)
-        return box
-
-    def _build_video_region(self) -> QWidget:
-        box = QWidget()
-        layout = QVBoxLayout(box)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
-
+        center_panel = QVBoxLayout()
         self.video_title = QLabel("当前视频：")
         self.video_title.setStyleSheet("font-size:18px; font-weight:700;")
         self.video_widget = QVideoWidget()
         self.video_widget.setStyleSheet("background:#111;")
-        self.video_widget.setMinimumSize(180, 180)
-
-        layout.addWidget(self.video_title)
-        layout.addWidget(self.video_widget, 1)
-        return box
-
-    def _build_timeline_region(self) -> QWidget:
-        box = QWidget()
-        box.setMinimumHeight(MIN_TIMELINE_HEIGHT)
-        layout = QVBoxLayout(box)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-
-        self.time_label = QLabel("00:00 / 00:00")
-        self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.time_label.setStyleSheet("color:#666; font-size:12px; padding-bottom:1px;")
-        layout.addWidget(self.time_label)
+        self.video_widget.setMinimumSize(320, 200)
+        self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.position_slider = QSlider(Qt.Orientation.Horizontal)
+        self.position_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.position_slider.setRange(0, 0)
         self.position_slider.setSingleStep(100)
         self.position_slider.sliderPressed.connect(self.on_slider_pressed)
         self.position_slider.sliderMoved.connect(self.on_slider_moved)
         self.position_slider.sliderReleased.connect(self.on_slider_released)
-        layout.addWidget(self.position_slider)
 
-        self.waveform_wrap = QWidget()
-        self.waveform_wrap.setMinimumHeight(64)
-        wave_grid = QGridLayout(self.waveform_wrap)
-        wave_grid.setContentsMargins(0, 0, 0, 0)
-        wave_grid.setSpacing(0)
+        self.time_label = QLabel("00:00 / 00:00")
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.time_label.setStyleSheet("color:#444;")
+        self.time_label.setMinimumWidth(88)
 
         self.waveform_widget = WaveformWidget()
-        self.waveform_widget.setMinimumHeight(64)
+        self.waveform_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.waveform_widget.seek_requested.connect(self.on_waveform_seek_requested)
-        wave_grid.addWidget(self.waveform_widget, 0, 0)
 
-        self.btn_toggle_waveform = QPushButton()
-        self.btn_toggle_waveform.setFixedSize(28, 22)
-        self.btn_toggle_waveform.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_toggle_waveform.setStyleSheet(
-            "QPushButton{border:1px solid #d1d5db;border-radius:6px;background:rgba(255,255,255,0.92);padding:0 2px;margin:0 4px 4px 0;}"
-            "QPushButton:hover{background:#f5f7fa;}"
-            "QPushButton:pressed{background:#eef2f7;}"
-        )
-        self.btn_toggle_waveform.clicked.connect(self.toggle_waveform_visible)
-        self.btn_toggle_waveform.setToolTip("隐藏波形")
-        wave_grid.addWidget(
-            self.btn_toggle_waveform,
-            0,
-            0,
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
-        )
-        layout.addWidget(self.waveform_wrap, 1)
+        controls = QHBoxLayout()
+        self.btn_pause = QPushButton()
+        self.btn_mark_in = QPushButton()
+        self.btn_mark_out = QPushButton()
+        self.btn_pass = QPushButton()
+        self.btn_fail = QPushButton()
+        self.btn_prev = QPushButton()
+        self.btn_end = QPushButton()
+        self.btn_reload = QPushButton("重新加载目录")
 
-        self.path_info = QLabel()
-        self.path_info.setWordWrap(True)
-        self.path_info.setStyleSheet("color:#666;")
-        return box
+        self.btn_pause.clicked.connect(self.toggle_pause)
+        self.btn_mark_in.clicked.connect(self.mark_trim_in)
+        self.btn_mark_out.clicked.connect(self.mark_trim_out_and_save)
+        self.btn_pass.clicked.connect(self.mark_pass)
+        self.btn_fail.clicked.connect(self.mark_fail)
+        self.btn_prev.clicked.connect(self.go_previous)
+        self.btn_end.clicked.connect(self.finish_review)
+        self.btn_reload.clicked.connect(self.reload_and_reset)
 
-    def _build_right_region(self) -> QWidget:
-        box = QWidget()
-        layout = QVBoxLayout(box)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        for btn in [self.btn_pause, self.btn_mark_in, self.btn_mark_out, self.btn_pass, self.btn_fail, self.btn_prev, self.btn_end, self.btn_reload]:
+            controls.addWidget(btn)
 
-        title = QLabel("审核记录")
-        title.setStyleSheet("font-size:18px; font-weight:700;")
+        self.current_status = QLabel("状态：未开始")
+        self.current_status.setStyleSheet("font-size:15px;")
+        self.selection_label = QLabel("裁剪区间：未设置")
+        self.selection_label.setStyleSheet("color:#555;")
+        self.shortcut_hint = QLabel()
+        self.shortcut_hint.setStyleSheet("color:#666;")
+
+        timeline_grid = QGridLayout()
+        timeline_grid.setContentsMargins(0, 0, 0, 0)
+        timeline_grid.setHorizontalSpacing(8)
+        timeline_grid.setVerticalSpacing(6)
+        timeline_grid.addWidget(self.position_slider, 0, 0)
+        timeline_grid.addWidget(self.time_label, 0, 1)
+        timeline_grid.addWidget(self.waveform_widget, 1, 0)
+        timeline_grid.setColumnStretch(0, 1)
+
+        center_panel.addWidget(self.video_title)
+        center_panel.addWidget(self.video_widget, 1)
+        center_panel.addLayout(timeline_grid)
+        center_panel.addWidget(self.current_status)
+        center_panel.addWidget(self.selection_label)
+        center_panel.addWidget(self.shortcut_hint)
+        center_panel.addLayout(controls)
+        center_container = QWidget()
+        center_container.setLayout(center_panel)
+        center_container.setMinimumWidth(360)
+        center_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        right_panel = QVBoxLayout()
+        right_title = QLabel("参考图片区")
+        right_title.setStyleSheet("font-size:18px; font-weight:700;")
+        self.reference_dir_label = QLabel()
+        self.reference_dir_label.setWordWrap(True)
+        self.reference_dir_label.setStyleSheet("color:#666;")
+        self.reference_info = QLabel("未匹配到参考图")
+        self.reference_info.setWordWrap(True)
+        self.reference_info.setStyleSheet("color:#333;")
+        self.reference_image_label = QLabel("暂无参考图")
+        self.reference_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.reference_image_label.setMinimumSize(220, 260)
+        self.reference_image_label.setStyleSheet("border:1px solid #ddd; border-radius:10px; background:#fafafa; color:#666;")
+        self.reference_hint = QLabel()
+        self.reference_hint.setWordWrap(True)
+        self.reference_hint.setStyleSheet("color:#666;")
+        self.btn_cycle_reference = QPushButton()
+        self.btn_cycle_reference.clicked.connect(self.cycle_reference_image)
+        log_title = QLabel("审核记录")
+        log_title.setStyleSheet("font-size:16px; font-weight:700;")
         self.log_text = QTextEdit()
-        self.log_text.setMinimumWidth(MIN_RIGHT_PANEL_WIDTH - 16)
         self.log_text.setReadOnly(True)
-        self.log_text.setPlaceholderText("这里会显示审核记录与结束后的处理结果。")
+        self.log_text.setPlaceholderText("这里会显示审核记录、裁剪结果与结束后的移动结果。")
+        right_panel.addWidget(right_title)
+        right_panel.addWidget(self.reference_dir_label)
+        right_panel.addWidget(self.reference_info)
+        right_panel.addWidget(self.reference_image_label, 3)
+        right_panel.addWidget(self.reference_hint)
+        right_panel.addWidget(self.btn_cycle_reference)
+        right_panel.addWidget(log_title)
+        right_panel.addWidget(self.log_text, 2)
+        right_container = QWidget()
+        right_container.setLayout(right_panel)
+        right_container.setMinimumWidth(220)
+        right_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
-        layout.addWidget(title)
-        layout.addWidget(self.path_info)
-        layout.addWidget(self.log_text, 1)
-        return box
+        root_splitter.addWidget(left_container)
+        root_splitter.addWidget(center_container)
+        root_splitter.addWidget(right_container)
+        root_splitter.setStretchFactor(0, 2)
+        root_splitter.setStretchFactor(1, 6)
+        root_splitter.setStretchFactor(2, 3)
+        root_splitter.setSizes([260, 860, 320])
+        page.addWidget(root_splitter, 1)
 
-    def _build_menu(self) -> None:
+        self.setStatusBar(QStatusBar())
+
         menu = self.menuBar().addMenu("文件")
         action_open = QAction("打开程序目录", self)
         action_open.triggered.connect(self.open_base_dir)
@@ -742,33 +655,11 @@ class ReviewWindow(QMainWindow):
         self.player.setVideoOutput(self.video_widget)
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         self.player.errorOccurred.connect(self.on_player_error)
-        self.player.positionChanged.connect(self.on_position_changed)
         self.player.durationChanged.connect(self.on_duration_changed)
-
-    def _restore_splitter_sizes(self) -> None:
-        QTimer.singleShot(0, self._apply_splitter_sizes)
-
-    def _apply_splitter_sizes(self) -> None:
-        body_sizes = self.splitter_sizes.get("body_horizontal", DEFAULT_SPLITTER_SIZES["body_horizontal"])
-        center_sizes = self.splitter_sizes.get("center_vertical", DEFAULT_SPLITTER_SIZES["center_vertical"])
-        self.body_horizontal_splitter.setSizes(body_sizes)
-        self.center_vertical_splitter.setSizes(center_sizes)
-        self._update_waveform_visibility_ui()
-
-    def _remember_splitter_sizes(self, key: str, splitter: QSplitter) -> None:
-        sizes = [int(x) for x in splitter.sizes() if int(x) > 0]
-        if sizes:
-            self.splitter_sizes[key] = sizes
-            self.save_config()
-
-    def reset_layout_proportions(self) -> None:
-        self.splitter_sizes = json.loads(json.dumps(DEFAULT_SPLITTER_SIZES))
-        self._apply_splitter_sizes()
-        self.save_config()
-        self.log("布局比例已恢复默认。")
+        self.player.positionChanged.connect(self.on_position_changed)
 
     def _bind_shortcuts(self) -> None:
-        bindings = {
+        mapping = {
             "pass": self.mark_pass,
             "fail": self.mark_fail,
             "previous": self.go_previous,
@@ -776,43 +667,118 @@ class ReviewWindow(QMainWindow):
             "pause": self.toggle_pause,
             "trim_in": self.mark_trim_in,
             "trim_out": self.mark_trim_out_and_save,
+            "cycle_reference": self.cycle_reference_image,
         }
-        for key, callback in bindings.items():
+        for key, func in mapping.items():
             shortcut = self.shortcut_objects.get(key)
             if shortcut is None:
                 shortcut = QShortcut(self)
-                shortcut.activated.connect(callback)
+                shortcut.activated.connect(func)
                 self.shortcut_objects[key] = shortcut
             shortcut.setKey(QKeySequence(self.shortcuts_map[key]))
         self.refresh_shortcut_texts()
 
-    def refresh_shortcut_texts(self) -> None:
-        native = lambda key: QKeySequence(self.shortcuts_map[key]).toString(QKeySequence.SequenceFormat.NativeText)
-        self.shortcut_summary_text = (
-            f"快捷键：{native('pause')}=暂停/继续，{native('trim_in')}=起点，{native('trim_out')}=裁剪通过，"
-            f"{native('pass')}=通过，{native('fail')}=不通过，{native('previous')}=返回上一条，{native('end')}=结束审核"
-        )
-        self.statusBar().showMessage(self.shortcut_summary_text, 8000)
+    def _load_config(self) -> None:
+        if not self.config_path.exists():
+            default_logo = self.base_dir / LOGO_FILE_NAME
+            self.logo_path = default_logo if default_logo.exists() else None
+            return
+        try:
+            data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
 
-    def refresh_settings_display(self) -> None:
-        self.path_info.setText(
-            f"源目录：{self.source_dir}\n"
-            f"通过目录：{self.pass_dir}\n"
-            f"不通过目录：{self.fail_dir}\n"
-            f"说明：普通通过/不通过在结束审核后统一处理；I/O 裁剪通过会即时输出到通过目录。"
-        )
-        self.refresh_shortcut_texts()
+        self.source_dir = self.resolve_config_path(data.get("source_dir"), self.base_dir / SOURCE_DIR_NAME)
+        self.pass_dir = self.resolve_config_path(data.get("pass_dir"), self.base_dir / PASS_DIR_NAME)
+        self.fail_dir = self.resolve_config_path(data.get("fail_dir"), self.base_dir / FAIL_DIR_NAME)
+        self.product_library_dir = self.resolve_config_path(data.get("product_library_dir"), self.base_dir / PRODUCT_LIBRARY_DIR_NAME)
+
+        logo_value = data.get("logo_path")
+        if logo_value:
+            self.logo_path = self.resolve_config_path(logo_value, self.base_dir / LOGO_FILE_NAME)
+        else:
+            default_logo = self.base_dir / LOGO_FILE_NAME
+            self.logo_path = default_logo if default_logo.exists() else None
+
+        selection_map = data.get("reference_selection_map") or {}
+        self.reference_selection_map = {str(k): str(v) for k, v in selection_map.items() if k and v}
+
+        shortcuts = data.get("shortcuts") or {}
+        for key, default_value in DEFAULT_SHORTCUTS.items():
+            value = shortcuts.get(key)
+            if value:
+                self.shortcuts_map[key] = value
+            else:
+                self.shortcuts_map[key] = default_value
+
+    @staticmethod
+    def resolve_config_path(value: Optional[str], default: Path) -> Path:
+        if not value:
+            return default
+        path = Path(value)
+        return path if path.is_absolute() else (default.parent / path)
+
+    def save_config(self) -> None:
+        data = {
+            "source_dir": str(self.source_dir),
+            "pass_dir": str(self.pass_dir),
+            "fail_dir": str(self.fail_dir),
+            "product_library_dir": str(self.product_library_dir),
+            "logo_path": str(self.logo_path) if self.logo_path else "",
+            "reference_selection_map": self.reference_selection_map,
+            "shortcuts": self.shortcuts_map,
+        }
+        self.config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _apply_logo(self) -> None:
+        icon_path = None
+        if self.logo_path and self.logo_path.exists():
+            icon_path = self.logo_path
+        else:
+            bundled = self.resource_dir / LOGO_FILE_NAME
+            if bundled.exists():
+                icon_path = bundled
+                self.logo_path = bundled
+        if icon_path and icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
 
     def _update_logo_preview(self) -> None:
-        if not hasattr(self, "logo_preview"):
-            return
-        pix = QPixmap()
         if self.logo_path and self.logo_path.exists():
-            pix.load(str(self.logo_path))
-        if not pix.isNull():
-            self.logo_preview.setPixmap(pix.scaled(self.logo_preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        else:
-            self.logo_preview.setText("Logo")
+            pixmap = QPixmap(str(self.logo_path))
+            if not pixmap.isNull():
+                self.logo_preview.setPixmap(pixmap.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                return
+        self.logo_preview.setText("Logo")
+
+    def refresh_shortcut_texts(self) -> None:
+        def native(name: str) -> str:
+            return QKeySequence(self.shortcuts_map[name]).toString(QKeySequence.SequenceFormat.NativeText)
+
+        self.btn_pause.setText(f"暂停/继续 ({native('pause')})")
+        self.btn_mark_in.setText(f"设置起点 ({native('trim_in')})")
+        self.btn_mark_out.setText(f"裁剪到通过 ({native('trim_out')})")
+        self.btn_pass.setText(f"通过 ({native('pass')})")
+        self.btn_fail.setText(f"不通过 ({native('fail')})")
+        self.btn_prev.setText(f"返回上一条 ({native('previous')})")
+        self.btn_end.setText(f"结束审核 ({native('end')})")
+        self.btn_cycle_reference.setText(f"切换参考图 ({native('cycle_reference')})")
+        self.shortcut_hint.setText(
+            f"快捷键：{native('pause')}=暂停/继续，{native('trim_in')}=起点，{native('trim_out')}=裁剪通过，"
+            f"{native('pass')}=通过，{native('fail')}=不通过，{native('previous')}=返回上一条，{native('end')}=结束审核，"
+            f"{native('cycle_reference')}=切换参考图"
+        )
+        self.reference_hint.setText(
+            f"按 {native('cycle_reference')} 可切换当前产品参考图；切换后会自动记住，后续同产品视频默认使用这张图。"
+        )
+
+    def refresh_settings_display(self) -> None:
+        self.reference_dir_label.setText(
+            f"产品库目录：{self.product_library_dir}\n"
+            f"源目录：{self.source_dir}\n"
+            f"通过目录：{self.pass_dir}｜不通过目录：{self.fail_dir}"
+        )
+        self.refresh_shortcut_texts()
+        self._update_logo_preview()
 
     def _load_videos(self) -> None:
         self.items.clear()
@@ -820,29 +786,32 @@ class ReviewWindow(QMainWindow):
         self.current_index = -1
         self.review_active = False
         self.moved_after_finish = False
-        self.player.stop()
-        self.position_slider.setRange(0, 0)
-        self.position_slider.setValue(0)
-        self.time_label.setText("00:00 / 00:00")
-        self.waveform_widget.clear()
-        self.log_text.clear()
+        self.current_trim_in_ms = None
+        self.current_trim_out_ms = None
+        self.refresh_reference_library_index()
+        self.clear_reference_preview("暂无参考图")
 
         if not self.source_dir.exists():
-            self.summary_label.setText(f"未找到待审核目录：{self.source_dir}")
-            self.log(f"未找到待审核目录：{self.source_dir}")
-            self._refresh_bottom_status(None)
+            self.summary_label.setText(f"未找到源目录：{self.source_dir}")
+            self.log(f"未找到源目录：{self.source_dir}")
+            self.current_status.setText("状态：未找到源目录")
+            self.waveform_widget.clear("未找到源目录")
+            self.reference_info.setText("未找到源目录，无法匹配参考图。")
             return
 
         files = self._collect_video_files(self.source_dir)
         for file_path in files:
             relative_path = file_path.relative_to(self.source_dir)
-            self.items.append(VideoItem(source_path=file_path, relative_path=relative_path))
+            item = VideoItem(source_path=file_path, relative_path=relative_path)
+            self.items.append(item)
             self.queue_list.addItem(QListWidgetItem(str(relative_path)))
 
         if not self.items:
             self.summary_label.setText("没有找到可审核视频。")
-            self.log("待审核目录中没有找到视频文件。")
-            self._refresh_bottom_status(None)
+            self.current_status.setText("状态：没有视频")
+            self.waveform_widget.clear("没有视频")
+            self.reference_info.setText("当前没有视频。")
+            self.log("源目录中没有找到视频文件。")
             return
 
         self.review_active = True
@@ -852,27 +821,26 @@ class ReviewWindow(QMainWindow):
         self.log(f"已加载 {len(self.items)} 个视频，准备开始审核。")
 
     def _collect_video_files(self, directory: Path) -> list[Path]:
-        files = [p for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS]
-        return sorted(files, key=lambda p: self.natural_sort_key(str(p.relative_to(directory))))
-
-    @staticmethod
-    def natural_sort_key(text: str):
         import re
-        return [int(token) if token.isdigit() else token.lower() for token in re.split(r"(\d+)", text)]
+        files = [p for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS]
+        def natural_sort_key(path: Path):
+            text = str(path.relative_to(directory))
+            return [int(token) if token.isdigit() else token.lower() for token in re.split(r"(\d+)", text)]
+        return sorted(files, key=natural_sort_key)
 
     def update_queue_view(self) -> None:
+        total = len(self.items)
         pending = sum(1 for x in self.items if x.status is None)
         passed = sum(1 for x in self.items if x.status == "pass")
         failed = sum(1 for x in self.items if x.status == "fail")
         trimmed = sum(1 for x in self.items if x.status == "trim_pass")
-        total = len(self.items)
         current = self.current_index + 1 if 0 <= self.current_index < total else 0
         self.summary_label.setText(
             f"总数：{total}｜当前：{current}/{total}｜待审：{pending}｜通过：{passed}｜截断通过：{trimmed}｜不通过：{failed}"
         )
         for idx, review_item in enumerate(self.items):
-            item = self.queue_list.item(idx)
-            if item is None:
+            list_item = self.queue_list.item(idx)
+            if list_item is None:
                 continue
             prefix = "[待审]"
             if review_item.status == "pass":
@@ -881,66 +849,108 @@ class ReviewWindow(QMainWindow):
                 prefix = "[不通过]"
             elif review_item.status == "trim_pass":
                 prefix = "[截断通过]"
-            item.setText(f"{prefix} {review_item.relative_path}")
-            item.setSelected(idx == self.current_index)
+            list_item.setText(f"{prefix} {review_item.relative_path}")
+            list_item.setSelected(idx == self.current_index)
             if idx == self.current_index:
-                self.queue_list.scrollToItem(item)
+                self.queue_list.scrollToItem(list_item)
 
     def load_current_video(self) -> None:
         if not (0 <= self.current_index < len(self.items)):
             self.video_title.setText("当前视频：无")
-            self.player.stop()
+            self.current_status.setText("状态：审核结束")
+            self.selection_label.setText("裁剪区间：未设置")
             self.position_slider.setRange(0, 0)
-            self.position_slider.setValue(0)
             self.time_label.setText("00:00 / 00:00")
-            self.waveform_widget.clear("没有视频")
-            self._update_trim_selection_ui(None)
-            self._refresh_bottom_status(None)
+            self.waveform_widget.clear("审核结束")
+            self.clear_reference_preview("审核结束")
+            self.player.stop()
             return
 
         item = self.items[self.current_index]
-        self.video_title.setText(f"当前视频：{item.relative_path.name}")
-        state_text = {
-            None: "待审核",
-            "pass": "已标记通过",
-            "fail": "已标记不通过",
-            "trim_pass": "已裁剪并通过",
-        }[item.status]
-        self.position_slider.setRange(0, 0)
+        self.current_trim_in_ms = item.trim_in_ms
+        self.current_trim_out_ms = item.trim_out_ms
+        self.video_title.setText(f"当前视频：{item.relative_path}")
+        state_text = "待审核"
+        if item.status == "pass":
+            state_text = "已标记通过"
+        elif item.status == "fail":
+            state_text = "已标记不通过"
+        elif item.status == "trim_pass":
+            state_text = "已截断通过"
+        self.current_status.setText(f"状态：{state_text}")
+
+        self.position_slider.blockSignals(True)
+        self.position_slider.setRange(0, max(0, item.duration_ms))
         self.position_slider.setValue(0)
+        self.position_slider.blockSignals(False)
         self.time_label.setText("00:00 / 00:00")
         self.waveform_widget.clear("波形加载中...")
-        self.start_waveform_loading(item.source_path)
+        self.refresh_selection_label()
+        self.update_waveform_selection()
         self.player.setSource(QUrl.fromLocalFile(str(item.source_path)))
         self.player.play()
-        self._update_trim_selection_ui(item)
         self.update_queue_view()
-        self._refresh_bottom_status(item, state_text)
+        self.statusBar().showMessage(f"正在播放：{item.relative_path}")
+        self.start_waveform_loading(item.source_path)
+        self.update_reference_preview_for_item(item)
 
-    def start_waveform_loading(self, source_path: Path) -> None:
+    def start_waveform_loading(self, video_path: Path) -> None:
         if self.waveform_thread and self.waveform_thread.isRunning():
             self.waveform_thread.finished_waveform.disconnect(self.on_waveform_ready)
             self.waveform_thread.requestInterruption()
-        self.waveform_request_path = str(source_path)
-        self.waveform_thread = WaveformThread(source_path)
+            self.waveform_thread.quit()
+            self.waveform_thread.wait(100)
+        self.waveform_request_path = str(video_path)
+        self.waveform_widget.clear("波形加载中...")
+        self.waveform_thread = WaveformThread(video_path)
         self.waveform_thread.finished_waveform.connect(self.on_waveform_ready)
         self.waveform_thread.start()
 
     @Slot(str, object, str)
-    def on_waveform_ready(self, source_path: str, peaks_obj: object, error_text: str) -> None:
+    def on_waveform_ready(self, source_path: str, peaks: object, error_text: str) -> None:
         if source_path != self.waveform_request_path:
             return
         if error_text:
-            self.waveform_widget.set_status("波形加载失败")
-            self.log(f"波形加载失败：{error_text}")
+            self.waveform_widget.set_status(f"波形加载失败：{error_text}")
             return
-        peaks = peaks_obj if isinstance(peaks_obj, list) else []
-        if peaks:
-            self.waveform_widget.set_peaks(peaks)
-        else:
-            self.waveform_widget.set_status("当前视频没有可显示的音频波形")
+        self.waveform_widget.set_peaks(list(peaks), "当前视频没有可显示的音频波形")
+        self.update_waveform_selection()
+
+    def on_duration_changed(self, duration: int) -> None:
+        self.position_slider.setRange(0, max(0, duration))
         if 0 <= self.current_index < len(self.items):
-            self._update_trim_selection_ui(self.items[self.current_index])
+            self.items[self.current_index].duration_ms = duration
+        self.update_time_label(self.player.position(), duration)
+        self.update_waveform_selection()
+
+    def on_position_changed(self, position: int) -> None:
+        if not self.user_dragging_slider:
+            self.position_slider.blockSignals(True)
+            self.position_slider.setValue(position)
+            self.position_slider.blockSignals(False)
+        duration = max(0, self.player.duration())
+        fraction = 0.0 if duration <= 0 else position / duration
+        self.waveform_widget.set_playhead_fraction(fraction)
+        self.update_time_label(position, duration)
+
+    def update_time_label(self, position: int, duration: int) -> None:
+        self.time_label.setText(f"{format_ms(position)} / {format_ms(duration)}")
+
+    def update_waveform_selection(self) -> None:
+        duration = self.player.duration()
+        if duration <= 0 and 0 <= self.current_index < len(self.items):
+            duration = self.items[self.current_index].duration_ms
+        if duration <= 0:
+            self.waveform_widget.set_selection(None, None)
+            return
+        in_fraction = None if self.current_trim_in_ms is None else self.current_trim_in_ms / duration
+        out_fraction = None if self.current_trim_out_ms is None else self.current_trim_out_ms / duration
+        self.waveform_widget.set_selection(in_fraction, out_fraction)
+
+    def refresh_selection_label(self) -> None:
+        in_text = format_ms(self.current_trim_in_ms) if self.current_trim_in_ms is not None else "未设置"
+        out_text = format_ms(self.current_trim_out_ms) if self.current_trim_out_ms is not None else "未设置"
+        self.selection_label.setText(f"裁剪区间：起点 {in_text} ｜ 终点 {out_text}")
 
     def next_unreviewed_or_next(self) -> None:
         next_idx = self.current_index + 1
@@ -952,76 +962,126 @@ class ReviewWindow(QMainWindow):
 
     @Slot()
     def mark_pass(self) -> None:
-        if not self._has_current_item():
+        if not self.review_active or not (0 <= self.current_index < len(self.items)):
             return
         item = self.items[self.current_index]
         item.status = "pass"
+        item.trim_in_ms = None
+        item.trim_out_ms = None
         self.log(f"通过：{item.relative_path}")
         self.next_unreviewed_or_next()
 
     @Slot()
     def mark_fail(self) -> None:
-        if not self._has_current_item():
+        if not self.review_active or not (0 <= self.current_index < len(self.items)):
             return
         item = self.items[self.current_index]
         item.status = "fail"
+        item.trim_in_ms = None
+        item.trim_out_ms = None
         self.log(f"不通过：{item.relative_path}")
         self.next_unreviewed_or_next()
 
     @Slot()
-    def mark_trim_in(self) -> None:
-        if not self._has_current_item():
+    def toggle_pause(self) -> None:
+        if not (0 <= self.current_index < len(self.items)):
             return
-        item = self.items[self.current_index]
-        trim_in = max(0, self.player.position())
-        item.trim_in_ms = trim_in
-        if item.trim_out_ms is not None and item.trim_out_ms <= trim_in:
-            item.trim_out_ms = None
-        self._update_trim_selection_ui(item)
-        self.log(f"设置起点 I：{item.relative_path} -> {format_ms(trim_in)}")
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            self.statusBar().showMessage("已暂停。", 2000)
+        else:
+            self.player.play()
+            self.statusBar().showMessage("继续播放。", 2000)
+
+    @Slot()
+    def mark_trim_in(self) -> None:
+        if not (0 <= self.current_index < len(self.items)):
+            return
+        self.current_trim_in_ms = self.player.position()
+        self.current_trim_out_ms = None if self.current_trim_out_ms is not None and self.current_trim_out_ms <= self.current_trim_in_ms else self.current_trim_out_ms
+        self.items[self.current_index].trim_in_ms = self.current_trim_in_ms
+        self.items[self.current_index].trim_out_ms = self.current_trim_out_ms
+        self.refresh_selection_label()
+        self.update_waveform_selection()
+        self.log(f"设置裁剪起点：{self.items[self.current_index].relative_path} -> {format_ms(self.current_trim_in_ms)}")
+        self.statusBar().showMessage(f"已设置起点：{format_ms(self.current_trim_in_ms)}", 2500)
 
     @Slot()
     def mark_trim_out_and_save(self) -> None:
-        if not self._has_current_item():
+        if not self.review_active or not (0 <= self.current_index < len(self.items)):
             return
         item = self.items[self.current_index]
-        trim_out = max(0, self.player.position())
-        trim_in = item.trim_in_ms or 0
-        if trim_out <= trim_in + 80:
-            QMessageBox.warning(self, "裁剪失败", "终点必须晚于起点。")
+        end_ms = self.player.position()
+        start_ms = self.current_trim_in_ms or 0
+        if end_ms <= start_ms:
+            QMessageBox.warning(self, "裁剪无效", "终点必须大于起点。请先设置 I，再在更靠后的位置按 O。")
+            return
+        if end_ms - start_ms < 100:
+            QMessageBox.warning(self, "裁剪无效", "裁剪区间太短，请至少保留 0.1 秒。")
             return
 
-        output_path = self._make_trim_output_path(item)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.player.pause()
+        self.current_trim_out_ms = end_ms
+        item.trim_in_ms = start_ms
+        item.trim_out_ms = end_ms
+        self.refresh_selection_label()
+        self.update_waveform_selection()
+
         try:
-            trim_video_segment(item.source_path, output_path, trim_in / 1000.0, trim_out / 1000.0)
+            clip_output_path = self.create_trimmed_clip(item, start_ms, end_ms)
         except Exception as exc:
-            QMessageBox.critical(self, "裁剪失败", str(exc))
-            self.log(f"裁剪失败：{item.relative_path}，原因：{exc}")
+            QMessageBox.critical(self, "裁剪失败", f"生成裁剪视频失败：\n{exc}")
+            self.log(f"裁剪失败：{item.relative_path} -> {exc}")
             return
 
-        item.trim_out_ms = trim_out
-        item.clip_output_path = output_path
         item.status = "trim_pass"
-        self._update_trim_selection_ui(item)
+        item.clip_output_path = clip_output_path
         self.log(
-            f"裁剪并通过：{item.relative_path} -> {output_path.name}，区间 {format_ms(trim_in)} - {format_ms(trim_out)}"
+            f"截断通过：{item.relative_path} -> {clip_output_path} "
+            f"(区间 {format_ms(start_ms)} ~ {format_ms(end_ms)})"
         )
         self.next_unreviewed_or_next()
 
-    def _make_trim_output_path(self, item: VideoItem) -> Path:
-        target = self.pass_dir / item.relative_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            target = self._make_unique_path(target)
-        return target
+    def create_trimmed_clip(self, item: VideoItem, start_ms: int, end_ms: int) -> Path:
+        ffmpeg_exe = get_ffmpeg_exe()
+        target_relative = item.relative_path.with_suffix(".mp4")
+        target_path = self.pass_dir / target_relative
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.exists():
+            target_path = self._make_unique_path(target_path)
 
-    @Slot()
-    def toggle_pause(self) -> None:
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-        else:
-            self.player.play()
+        start_sec = f"{start_ms / 1000:.3f}"
+        duration_sec = f"{max(0.001, (end_ms - start_ms) / 1000):.3f}"
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-ss",
+            start_sec,
+            "-i",
+            str(item.source_path),
+            "-t",
+            duration_sec,
+            "-map",
+            "0:v:0?",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            str(target_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            error_text = (result.stderr or result.stdout or "未知错误").strip()
+            raise RuntimeError(error_text)
+        return target_path
 
     @Slot()
     def go_previous(self) -> None:
@@ -1031,20 +1091,24 @@ class ReviewWindow(QMainWindow):
             self.statusBar().showMessage("已经是第一条，无法返回。", 3000)
             return
         self.current_index -= 1
-        prev_item = self.items[self.current_index]
-        if prev_item.status == "trim_pass" and prev_item.clip_output_path and prev_item.clip_output_path.exists():
-            try:
-                prev_item.clip_output_path.unlink()
-            except Exception:
-                pass
-        prev_item.status = None
-        prev_item.trim_in_ms = None
-        prev_item.trim_out_ms = None
-        prev_item.clip_output_path = None
-        self.log(f"返回上一条重审：{prev_item.relative_path}")
+        item = self.items[self.current_index]
+        self.reset_item_review(item, remove_generated_clip=True)
+        self.log(f"返回上一条重审：{item.relative_path}")
         self.load_current_video()
 
-    @Slot()
+    def reset_item_review(self, item: VideoItem, remove_generated_clip: bool) -> None:
+        if remove_generated_clip and item.clip_output_path and item.clip_output_path.exists():
+            try:
+                item.clip_output_path.unlink()
+                self.log(f"已删除旧裁剪结果：{item.clip_output_path}")
+            except Exception as exc:
+                self.log(f"删除旧裁剪结果失败：{item.clip_output_path} -> {exc}")
+        item.status = None
+        item.trim_in_ms = None
+        item.trim_out_ms = None
+        item.clip_output_path = None
+
+    @Slot(bool)
     def finish_review(self, auto_finished: bool = False) -> None:
         if self.moved_after_finish:
             self.close()
@@ -1057,8 +1121,8 @@ class ReviewWindow(QMainWindow):
 
         pending = sum(1 for x in self.items if x.status is None)
         passed = sum(1 for x in self.items if x.status == "pass")
-        trimmed = sum(1 for x in self.items if x.status == "trim_pass")
         failed = sum(1 for x in self.items if x.status == "fail")
+        trimmed = sum(1 for x in self.items if x.status == "trim_pass")
 
         msg = (
             f"审核结束。\n\n"
@@ -1066,11 +1130,12 @@ class ReviewWindow(QMainWindow):
             f"截断通过：{trimmed}\n"
             f"不通过：{failed}\n"
             f"未处理：{pending}\n"
-            f"已处理文件：{moved_count}"
+            f"已移动源文件：{moved_count}\n\n"
+            f"说明：截断通过生成的新视频已直接保存到通过目录，原始文件默认保留在源目录。"
         )
         QMessageBox.information(self, "审核完成" if auto_finished else "审核结束", msg)
+        self.current_status.setText("状态：审核结束，已按记录处理")
         self.statusBar().showMessage("审核已结束。", 5000)
-        self._refresh_bottom_status(None)
 
     def apply_moves(self) -> int:
         moved = 0
@@ -1080,30 +1145,15 @@ class ReviewWindow(QMainWindow):
             target_root = self.pass_dir if item.status == "pass" else self.fail_dir
             target_path = target_root / item.relative_path
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            if target_path.exists():
-                target_path = self._make_unique_path(target_path)
             if not item.source_path.exists():
                 self.log(f"跳过（源文件不存在）：{item.relative_path}")
                 continue
-            try:
-                shutil.move(str(item.source_path), str(target_path))
-                self.log(f"已移动：{item.relative_path} -> {target_path}")
-                moved += 1
-                self.cleanup_empty_parents(item.source_path.parent, self.source_dir)
-            except Exception as exc:
-                self.log(f"处理失败：{item.relative_path}，原因：{exc}")
+            if target_path.exists():
+                target_path = self._make_unique_path(target_path)
+            shutil.move(str(item.source_path), str(target_path))
+            moved += 1
+            self.log(f"已移动：{item.relative_path} -> {target_path}")
         return moved
-
-    @staticmethod
-    def cleanup_empty_parents(start_dir: Path, stop_dir: Path) -> None:
-        current = start_dir
-        stop_dir = stop_dir.resolve()
-        while current.exists() and current.resolve() != stop_dir:
-            try:
-                current.rmdir()
-            except OSError:
-                break
-            current = current.parent
 
     @staticmethod
     def _make_unique_path(path: Path) -> Path:
@@ -1117,68 +1167,49 @@ class ReviewWindow(QMainWindow):
             idx += 1
         return candidate
 
-    @Slot()
+    @Slot(int)
     def on_media_status_changed(self, status) -> None:
-        if status == QMediaPlayer.MediaStatus.EndOfMedia and self._has_current_item():
+        if status == QMediaPlayer.MediaStatus.EndOfMedia and 0 <= self.current_index < len(self.items) and self.review_active:
             self.player.setPosition(0)
             self.player.play()
 
-    @Slot(int)
-    def on_position_changed(self, position: int) -> None:
-        if not self.is_slider_dragging:
-            self.position_slider.setValue(position)
-        duration = max(0, self.position_slider.maximum())
-        current_value = self.position_slider.value() if self.is_slider_dragging else position
-        self.time_label.setText(f"{format_ms(current_value)} / {format_ms(duration)}")
-        fraction = 0.0 if duration <= 0 else current_value / duration
-        self.waveform_widget.set_playhead_fraction(fraction)
-
-    @Slot(int)
-    def on_duration_changed(self, duration: int) -> None:
-        self.position_slider.setRange(0, max(0, duration))
-        self.time_label.setText(f"{format_ms(self.player.position())} / {format_ms(duration)}")
-        if self._has_current_item():
-            item = self.items[self.current_index]
-            item.duration_ms = duration
-            self._update_trim_selection_ui(item)
-
     @Slot()
     def on_slider_pressed(self) -> None:
-        self.is_slider_dragging = True
-        self.was_playing_before_drag = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        if not (0 <= self.current_index < len(self.items)):
+            return
+        self.user_dragging_slider = True
         self.player.pause()
 
     @Slot(int)
     def on_slider_moved(self, value: int) -> None:
-        duration = max(0, self.position_slider.maximum())
-        self.time_label.setText(f"{format_ms(value)} / {format_ms(duration)}")
-        fraction = 0.0 if duration <= 0 else value / duration
-        self.waveform_widget.set_playhead_fraction(fraction)
+        if not (0 <= self.current_index < len(self.items)):
+            return
         self.player.setPosition(value)
-        if self._has_current_item():
-            self._refresh_bottom_status(self.items[self.current_index])
+        self.update_time_label(value, self.player.duration())
+        duration = self.player.duration()
+        self.waveform_widget.set_playhead_fraction(0.0 if duration <= 0 else value / duration)
 
     @Slot()
     def on_slider_released(self) -> None:
-        self.player.setPosition(self.position_slider.value())
-        self.is_slider_dragging = False
-        if self._has_current_item():
-            self._refresh_bottom_status(self.items[self.current_index])
-        # 保持暂停，以便用户看当前帧；是否继续播放由空格键控制
+        value = self.position_slider.value()
+        self.player.setPosition(value)
+        self.user_dragging_slider = False
+        self.statusBar().showMessage("已定位到当前帧，按空格可继续播放。", 2500)
 
     @Slot(float)
     def on_waveform_seek_requested(self, fraction: float) -> None:
-        duration = self.position_slider.maximum()
+        duration = self.player.duration()
         if duration <= 0:
             return
         self.player.pause()
-        value = int(max(0.0, min(1.0, fraction)) * duration)
-        self.position_slider.setValue(value)
-        self.player.setPosition(value)
-        if self._has_current_item():
-            self._refresh_bottom_status(self.items[self.current_index])
+        position = int(duration * fraction)
+        self.position_slider.setValue(position)
+        self.player.setPosition(position)
+        self.waveform_widget.set_playhead_fraction(fraction)
+        self.update_time_label(position, duration)
+        self.statusBar().showMessage("已定位到当前帧，按空格可继续播放。", 2500)
 
-    @Slot(object, str)
+    @Slot()
     def on_player_error(self, error, error_string) -> None:
         if error_string:
             self.log(f"播放器错误：{error_string}")
@@ -1193,7 +1224,7 @@ class ReviewWindow(QMainWindow):
         self.load_current_video()
 
     def reload_and_reset(self) -> None:
-        if self.items and self.review_active and not self.moved_after_finish:
+        if self.items and not self.moved_after_finish:
             reply = QMessageBox.question(
                 self,
                 "重新加载",
@@ -1203,99 +1234,277 @@ class ReviewWindow(QMainWindow):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
+        self.player.stop()
         self.log("重新加载目录并重置审核记录。")
         self._load_videos()
 
-    def open_settings_dialog(self) -> None:
-        if self.items and self.review_active and not self.moved_after_finish:
-            reply = QMessageBox.question(
-                self,
-                "修改设置",
-                "修改目录或快捷键后需要重新加载，当前审核记录会清空。是否继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+    def refresh_reference_library_index(self) -> None:
+        if not self.product_library_dir.exists():
+            self.reference_library_images = []
+            return
+        self.reference_library_images = sorted(
+            [
+                path for path in self.product_library_dir.rglob("*")
+                if path.is_file() and path.suffix.lower() in REFERENCE_IMAGE_EXTENSIONS
+            ],
+            key=lambda path: str(path.relative_to(self.product_library_dir)).lower(),
+        )
+
+    def clear_reference_preview(self, info_text: str) -> None:
+        self.current_reference_product_key = None
+        self.current_reference_display_name = ""
+        self.current_reference_images = []
+        self.current_reference_index = -1
+        self.reference_image_original_pixmap = None
+        self.reference_info.setText(info_text)
+        self.reference_image_label.setText("暂无参考图")
+        self.reference_image_label.setPixmap(QPixmap())
+
+    @staticmethod
+    def _normalize_reference_text(value: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", value).lower()
+
+    @staticmethod
+    def _split_reference_tokens(value: str) -> list[str]:
+        return [token for token in re.split(r"[-_\s]+", value) if token]
+
+    def derive_product_key(self, item: VideoItem) -> str:
+        candidates = self.derive_reference_candidates(item)
+        if not candidates:
+            return item.source_path.stem
+        return min(candidates, key=lambda value: (len(self._normalize_reference_text(value)), len(value)))
+
+    def derive_reference_candidates(self, item: VideoItem) -> list[str]:
+        raw_names: list[str] = []
+        relative_parts = item.relative_path.parts
+        if len(relative_parts) >= 2:
+            raw_names.append(relative_parts[0])
+            raw_names.append(item.relative_path.parent.name)
+        else:
+            raw_names.append(item.source_path.stem)
+
+        known_region_tokens = {
+            "英国", "美国", "德国", "法国", "意大利", "西班牙", "日本", "韩国", "加拿大", "澳大利亚", "澳洲",
+            "美区", "英区", "德区", "法区", "意区", "西区", "欧洲", "中东", "uk", "us", "usa", "de", "fr", "it", "es",
+        }
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add_candidate(name: str) -> None:
+            cleaned = name.strip().strip("/\\")
+            if not cleaned:
                 return
-        dialog = SettingsDialog(self, self.base_dir, self.source_dir, self.pass_dir, self.fail_dir, self.shortcuts_map, self.logo_path)
+            normalized = self._normalize_reference_text(cleaned)
+            if not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            candidates.append(cleaned)
+
+        for raw_name in raw_names:
+            add_candidate(raw_name)
+            parts = self._split_reference_tokens(raw_name)
+            if len(parts) >= 2:
+                add_candidate("-".join(parts[:-1]))
+                add_candidate(parts[0])
+                if parts[-1].lower() in known_region_tokens:
+                    add_candidate("-".join(parts[:-1]))
+                    add_candidate(parts[0])
+            elif parts:
+                add_candidate(parts[0])
+
+        return candidates
+
+    def find_reference_images_for_item(self, item: VideoItem) -> tuple[str, list[Path]]:
+        if not self.reference_library_images:
+            return self.derive_product_key(item), []
+
+        candidates = self.derive_reference_candidates(item)
+        candidate_norms = [self._normalize_reference_text(candidate) for candidate in candidates]
+        scored: list[tuple[int, str, Path]] = []
+        for image_path in self.reference_library_images:
+            relative_text = str(image_path.relative_to(self.product_library_dir))
+            path_norm = self._normalize_reference_text(relative_text)
+            parent_norm = self._normalize_reference_text(image_path.parent.name)
+            stem_norm = self._normalize_reference_text(image_path.stem)
+            score = 0
+            matched_name = ""
+            for candidate, candidate_norm in zip(candidates, candidate_norms):
+                if not candidate_norm:
+                    continue
+                if parent_norm == candidate_norm:
+                    score = max(score, 120)
+                    matched_name = candidate
+                elif stem_norm == candidate_norm:
+                    score = max(score, 100)
+                    matched_name = candidate
+                elif candidate_norm and candidate_norm in parent_norm:
+                    score = max(score, 80)
+                    matched_name = candidate
+                elif candidate_norm and candidate_norm in path_norm:
+                    score = max(score, 60)
+                    matched_name = candidate
+            if score > 0:
+                scored.append((score, relative_text.lower(), image_path))
+
+        if not scored:
+            return self.derive_product_key(item), []
+
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        images = [row[2] for row in scored]
+        product_key = self.derive_product_key(item)
+        for candidate in candidates:
+            if any(self._normalize_reference_text(candidate) in self._normalize_reference_text(str(path.parent.name)) or self._normalize_reference_text(candidate) == self._normalize_reference_text(path.parent.name) for path in images):
+                product_key = candidate
+                break
+        return product_key, images
+
+    def render_reference_pixmap(self) -> None:
+        if self.reference_image_original_pixmap is None or self.reference_image_original_pixmap.isNull():
+            return
+        target_size = self.reference_image_label.size()
+        scaled = self.reference_image_original_pixmap.scaled(
+            max(1, target_size.width() - 12),
+            max(1, target_size.height() - 12),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.reference_image_label.setPixmap(scaled)
+
+    def set_reference_image_by_index(self, index: int, persist: bool) -> None:
+        if not self.current_reference_images:
+            self.clear_reference_preview("未匹配到参考图")
+            return
+        index %= len(self.current_reference_images)
+        image_path = self.current_reference_images[index]
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            self.reference_image_original_pixmap = None
+            self.reference_image_label.setPixmap(QPixmap())
+            self.reference_image_label.setText("图片加载失败")
+            self.reference_info.setText(f"参考图加载失败：{image_path}")
+            return
+
+        self.current_reference_index = index
+        self.reference_image_original_pixmap = pixmap
+        self.reference_image_label.setText("")
+        self.render_reference_pixmap()
+
+        relative_path = image_path
+        if self.product_library_dir.exists():
+            try:
+                relative_path = image_path.relative_to(self.product_library_dir)
+            except ValueError:
+                pass
+
+        self.reference_info.setText(
+            f"当前产品：{self.current_reference_display_name}\n"
+            f"参考图：{index + 1}/{len(self.current_reference_images)}\n"
+            f"文件：{relative_path}"
+        )
+
+        if persist and self.current_reference_product_key:
+            self.reference_selection_map[self.current_reference_product_key] = str(image_path)
+            self.save_config()
+
+    def update_reference_preview_for_item(self, item: VideoItem) -> None:
+        if not self.product_library_dir.exists():
+            self.clear_reference_preview(f"未找到产品库目录：{self.product_library_dir}")
+            return
+
+        product_key, images = self.find_reference_images_for_item(item)
+        self.current_reference_product_key = product_key
+        self.current_reference_display_name = product_key
+        self.current_reference_images = images
+
+        if not images:
+            self.current_reference_index = -1
+            self.reference_image_original_pixmap = None
+            self.reference_image_label.setPixmap(QPixmap())
+            self.reference_image_label.setText("暂无参考图")
+            self.reference_info.setText(
+                f"当前产品：{product_key}\n未在产品库中匹配到参考图。"
+            )
+            return
+
+        saved_path = self.reference_selection_map.get(product_key, "")
+        selected_index = 0
+        if saved_path:
+            for idx, image_path in enumerate(images):
+                if str(image_path) == saved_path:
+                    selected_index = idx
+                    break
+
+        self.set_reference_image_by_index(selected_index, persist=False)
+
+    @Slot()
+    def cycle_reference_image(self) -> None:
+        if not self.current_reference_images:
+            self.statusBar().showMessage("当前产品没有可切换的参考图。", 3000)
+            return
+        next_index = (self.current_reference_index + 1) % len(self.current_reference_images)
+        self.set_reference_image_by_index(next_index, persist=True)
+        self.log(
+            f"已切换参考图：{self.current_reference_display_name} -> "
+            f"{self.current_reference_images[next_index].name}"
+        )
+        self.statusBar().showMessage("已切换当前产品参考图。", 2500)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self.render_reference_pixmap()
+
+    def open_settings_dialog(self) -> None:
+        dialog = SettingsDialog(
+            self,
+            self.base_dir,
+            self.source_dir,
+            self.pass_dir,
+            self.fail_dir,
+            self.product_library_dir,
+            self.shortcuts_map,
+            self.logo_path,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         values = dialog.get_values()
-        self.source_dir = self._resolve_saved_path(values["source_dir"], self.base_dir / SOURCE_DIR_NAME)
-        self.pass_dir = self._resolve_saved_path(values["pass_dir"], self.base_dir / PASS_DIR_NAME)
-        self.fail_dir = self._resolve_saved_path(values["fail_dir"], self.base_dir / FAIL_DIR_NAME)
-        self.logo_path = self._resolve_saved_path(values["logo_path"], self._default_logo_path() or (self.base_dir / LOGO_FILE_NAME))
-        self.shortcuts_map = dict(values["shortcuts"])
+        old_source_dir = self.source_dir
+        old_product_library_dir = self.product_library_dir
+        self.source_dir = Path(values["source_dir"])
+        self.pass_dir = Path(values["pass_dir"])
+        self.fail_dir = Path(values["fail_dir"])
+        self.product_library_dir = Path(values["product_library_dir"])
+        logo_value = values["logo_path"].strip()
+        self.logo_path = Path(logo_value) if logo_value else None
+        self.shortcuts_map = values["shortcuts"]
+        self.save_config()
         self._apply_logo()
-        self._update_logo_preview()
         self._bind_shortcuts()
         self.refresh_settings_display()
-        self.save_config()
-        self.reload_and_reset()
+        self.log("设置已保存。")
+        if self.source_dir != old_source_dir or self.product_library_dir != old_product_library_dir:
+            self.reload_and_reset()
+        else:
+            self.refresh_reference_library_index()
+            if 0 <= self.current_index < len(self.items):
+                self.update_reference_preview_for_item(self.items[self.current_index])
+            self.statusBar().showMessage("设置已保存并立即生效。", 4000)
 
     def open_base_dir(self) -> None:
         if sys.platform.startswith("win"):
             os.startfile(str(self.base_dir))
-        elif sys.platform == "darwin":
-            subprocess.run(["open", str(self.base_dir)], check=False)
         else:
-            subprocess.run(["xdg-open", str(self.base_dir)], check=False)
-
-    def _update_trim_selection_ui(self, item: Optional[VideoItem]) -> None:
-        if item is None:
-            self.waveform_widget.set_selection(None, None)
-            return
-        duration = item.duration_ms or self.position_slider.maximum()
-        in_fraction = None if item.trim_in_ms is None or duration <= 0 else item.trim_in_ms / duration
-        out_fraction = None if item.trim_out_ms is None or duration <= 0 else item.trim_out_ms / duration
-        self.waveform_widget.set_selection(in_fraction, out_fraction)
-
-    def _refresh_bottom_status(self, item: Optional[VideoItem], state_text: Optional[str] = None) -> None:
-        if item is None:
-            self.statusBar().showMessage(getattr(self, "shortcut_summary_text", ""), 8000)
-            return
-        start_text = format_ms(item.trim_in_ms) if item.trim_in_ms is not None else "起点未设置"
-        end_text = format_ms(item.trim_out_ms) if item.trim_out_ms is not None else "终点未设置"
-        state_text = state_text or {None: "待审核", "pass": "已标记通过", "fail": "已标记不通过", "trim_pass": "已裁剪并通过"}[item.status]
-        self.statusBar().showMessage(f"状态：{state_text} ｜ 裁剪区间：{start_text} ～ {end_text} ｜ {getattr(self, 'shortcut_summary_text', '')}")
-
-    def toggle_waveform_visible(self) -> None:
-        self.waveform_visible = not self.waveform_visible
-        self._update_waveform_visibility_ui()
-        self.refresh_settings_display()
-        self.save_config()
-
-    def _update_waveform_visibility_ui(self) -> None:
-        visible = getattr(self, "waveform_visible", True)
-        self.waveform_widget.setVisible(visible)
-        if hasattr(self, "waveform_wrap"):
-            self.waveform_wrap.setMinimumHeight(64 if visible else 28)
-        self.timeline_region.setMinimumHeight(MIN_TIMELINE_HEIGHT if visible else MIN_TIMELINE_HEIGHT_COLLAPSED)
-        self.btn_toggle_waveform.setIcon(build_eye_icon(visible))
-        self.btn_toggle_waveform.setIconSize(QSize(16, 16))
-        self.btn_toggle_waveform.setToolTip("隐藏波形" if visible else "显示波形")
+            QFileDialog.getOpenFileName(self, "程序目录", str(self.base_dir))
 
     def log(self, message: str) -> None:
         self.log_text.append(message)
 
-    def _has_current_item(self) -> bool:
-        return self.review_active and 0 <= self.current_index < len(self.items)
-
-    def resizeEvent(self, event) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        self.save_config()
-
-    def moveEvent(self, event) -> None:  # noqa: N802
-        super().moveEvent(event)
-        self.save_config()
-
-    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        self.save_config()
+    def closeEvent(self, event) -> None:  # noqa: N802
         if self.items and not self.moved_after_finish and self.review_active:
             reply = QMessageBox.question(
                 self,
                 "退出",
-                "当前仍有审核记录未执行处理。是否立即结束审核并按记录处理文件？",
+                "当前仍有审核记录未执行移动。是否立即结束审核并按记录移动文件？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Yes,
             )
@@ -1311,113 +1520,65 @@ class ReviewWindow(QMainWindow):
         event.accept()
 
 
-def get_ffmpeg_exe() -> str:
-    try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        return "ffmpeg"
+# ---------- helpers ----------
+
+def format_ms(ms: Optional[int]) -> str:
+    if ms is None or ms < 0:
+        return "00:00"
+    total_seconds = int(round(ms / 1000.0))
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
 
 
-def extract_waveform_peaks(video_path: Path, peak_count: int = 520) -> list[float]:
+def extract_waveform_peaks(video_path: Path, bins: int = 900, sample_rate: int = 8000) -> list[float]:
     ffmpeg_exe = get_ffmpeg_exe()
     cmd = [
         ffmpeg_exe,
+        "-v",
+        "error",
         "-i",
         str(video_path),
         "-vn",
         "-ac",
         "1",
         "-ar",
-        "8000",
+        str(sample_rate),
         "-f",
-        "f32le",
+        "s16le",
         "-",
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    if proc.returncode != 0 or not proc.stdout:
+    process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if process.returncode != 0:
+        stderr = process.stderr.decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(stderr or "ffmpeg 提取音频失败")
+
+    raw = process.stdout
+    if not raw:
         return []
-    import array
-    samples = array.array("f")
-    samples.frombytes(proc.stdout)
-    if not samples:
-        return []
+
+    samples = array("h")
+    samples.frombytes(raw)
+    if sys.byteorder != "little":
+        samples.byteswap()
     total = len(samples)
-    bucket_size = max(1, total // peak_count)
-    peaks: list[float] = []
-    for start in range(0, total, bucket_size):
-        chunk = samples[start:start + bucket_size]
-        if not chunk:
-            continue
-        peak = max(abs(v) for v in chunk)
-        peaks.append(float(min(1.0, peak)))
-    if len(peaks) > peak_count:
-        step = len(peaks) / peak_count
-        peaks = [peaks[min(len(peaks) - 1, int(i * step))] for i in range(peak_count)]
+    if total == 0:
+        return []
+
+    if total <= bins:
+        peaks = [min(1.0, abs(value) / 32768.0) for value in samples]
+    else:
+        bucket = total / bins
+        peaks = []
+        for i in range(bins):
+            start = int(i * bucket)
+            end = int((i + 1) * bucket)
+            segment = samples[start:max(start + 1, end)]
+            peak = max(abs(v) for v in segment) / 32768.0
+            peaks.append(min(1.0, peak))
     return peaks
-
-
-def trim_video_segment(source_path: Path, output_path: Path, start_sec: float, end_sec: float) -> None:
-    duration = max(0.0, end_sec - start_sec)
-    if duration <= 0.05:
-        raise RuntimeError("裁剪区间过短，未生成文件。")
-    ffmpeg_exe = get_ffmpeg_exe()
-
-    copy_cmd = [
-        ffmpeg_exe,
-        "-y",
-        "-ss",
-        f"{start_sec:.3f}",
-        "-i",
-        str(source_path),
-        "-t",
-        f"{duration:.3f}",
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ]
-    result = subprocess.run(copy_cmd, capture_output=True, text=True)
-    if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
-        return
-
-    reencode_cmd = [
-        ffmpeg_exe,
-        "-y",
-        "-ss",
-        f"{start_sec:.3f}",
-        "-i",
-        str(source_path),
-        "-t",
-        f"{duration:.3f}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "18",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ]
-    result2 = subprocess.run(reencode_cmd, capture_output=True, text=True)
-    if result2.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
-        stderr_text = (result2.stderr or result.stderr or "").strip()
-        raise RuntimeError(stderr_text or "ffmpeg 裁剪失败")
-
-
-def format_ms(ms: Optional[int]) -> str:
-    if ms is None:
-        return "--:--"
-    total_seconds = max(0, int(ms // 1000))
-    minutes = total_seconds // 60
-    seconds = total_seconds % 60
-    return f"{minutes:02d}:{seconds:02d}"
 
 
 def main() -> None:
