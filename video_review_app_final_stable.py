@@ -66,6 +66,21 @@ def get_ffmpeg_exe() -> str:
         return "ffmpeg"
 
 
+def get_hidden_subprocess_kwargs() -> dict:
+    kwargs: dict = {}
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if creationflags:
+            kwargs["creationflags"] = creationflags
+        startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+        if startupinfo_cls is not None:
+            startupinfo = startupinfo_cls()
+            startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+            startupinfo.wShowWindow = 0
+            kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
 @dataclass
 class VideoItem:
     source_path: Path
@@ -202,6 +217,31 @@ class WaveformThread(QThread):
             self.finished_waveform.emit(str(self.video_path), peaks, "")
         except Exception as exc:  # pragma: no cover
             self.finished_waveform.emit(str(self.video_path), [], str(exc))
+
+
+class FileWarmupThread(QThread):
+    finished_warmup = Signal(str)
+
+    def __init__(self, video_path: Path, head_bytes: int = 524288, tail_bytes: int = 262144) -> None:
+        super().__init__()
+        self.video_path = video_path
+        self.head_bytes = max(65536, head_bytes)
+        self.tail_bytes = max(65536, tail_bytes)
+
+    def run(self) -> None:
+        try:
+            with open(self.video_path, "rb") as fh:
+                fh.read(self.head_bytes)
+                try:
+                    file_size = fh.seek(0, os.SEEK_END)
+                except Exception:
+                    file_size = 0
+                if file_size > self.tail_bytes:
+                    fh.seek(max(0, file_size - self.tail_bytes), os.SEEK_SET)
+                    fh.read(self.tail_bytes)
+        except Exception:
+            pass
+        self.finished_warmup.emit(str(self.video_path))
 
 
 class SettingsDialog(QDialog):
@@ -418,6 +458,10 @@ class ReviewWindow(QMainWindow):
         self.shortcuts_map = DEFAULT_SHORTCUTS.copy()
         self.reference_selection_map: dict[str, str] = {}
         self.reference_library_images: list[Path] = []
+        self.reference_library_records: list[tuple[Path, str, str, str, str]] = []
+        self.reference_match_cache: dict[tuple[str, ...], tuple[str, list[Path]]] = {}
+        self.reference_pixmap_cache: dict[str, QPixmap] = {}
+        self.reference_library_error_text = ""
         self.current_reference_product_key: Optional[str] = None
         self.current_reference_display_name = ""
         self.current_reference_images: list[Path] = []
@@ -433,9 +477,21 @@ class ReviewWindow(QMainWindow):
         self.current_trim_out_ms: Optional[int] = None
         self.user_dragging_slider = False
         self.waveform_thread: Optional[WaveformThread] = None
+        self.waveform_threads: dict[str, WaveformThread] = {}
+        self.waveform_cache: dict[str, list[float]] = {}
         self.waveform_request_path: Optional[str] = None
+        self.file_warm_threads: dict[str, FileWarmupThread] = {}
+        self.warmed_video_paths: set[str] = set()
+        self.pending_player_request_id = 0
+        self.last_queue_index = -1
 
         self.shortcut_objects: dict[str, QShortcut] = {}
+        self.next_video_prefetch_timer = QTimer(self)
+        self.next_video_prefetch_timer.setSingleShot(True)
+        self.next_video_prefetch_timer.timeout.connect(self.prefetch_next_video_assets)
+        self.waveform_delay_timer = QTimer(self)
+        self.waveform_delay_timer.setSingleShot(True)
+        self.waveform_delay_timer.timeout.connect(self.load_delayed_waveform_for_current)
 
         self._load_config()
 
@@ -718,6 +774,68 @@ class ReviewWindow(QMainWindow):
         path = Path(value)
         return path if path.is_absolute() else (default.parent / path)
 
+    @staticmethod
+    def safe_path_exists(path: Path) -> bool:
+        try:
+            return path.exists()
+        except OSError:
+            return False
+
+    @staticmethod
+    def safe_path_is_dir(path: Path) -> bool:
+        try:
+            return path.is_dir()
+        except OSError:
+            return False
+
+    @staticmethod
+    def safe_relative_text(path: Path, base_dir: Path) -> str:
+        try:
+            return str(path.relative_to(base_dir))
+        except Exception:
+            return str(path)
+
+    @staticmethod
+    def describe_path_issue(path: Path, label: str) -> str:
+        try:
+            if not path.exists():
+                return f"未找到{label}：{path}"
+            if not path.is_dir():
+                return f"{label}不是文件夹：{path}"
+            return ""
+        except OSError as exc:
+            return f"{label}暂时无法访问：{path}\n{exc}"
+
+    @staticmethod
+    def safe_ensure_dir(path: Path) -> None:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(f"目录不可用：{path}\n{exc}") from exc
+
+    @staticmethod
+    def safe_unlink(path: Path) -> None:
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise RuntimeError(f"删除文件失败：{path}\n{exc}") from exc
+
+    def get_product_library_access_error(self) -> str:
+        issue = self.describe_path_issue(self.product_library_dir, "产品库目录")
+        if issue.startswith("未找到"):
+            return ""
+        return issue
+
+    def get_source_dir_access_error(self) -> str:
+        return self.describe_path_issue(self.source_dir, "源目录")
+
+    def get_pass_dir_access_error(self) -> str:
+        return self.describe_path_issue(self.pass_dir, "通过目录")
+
+    def get_fail_dir_access_error(self) -> str:
+        return self.describe_path_issue(self.fail_dir, "不通过目录")
+
+
     def save_config(self) -> None:
         data = {
             "source_dir": str(self.source_dir),
@@ -732,18 +850,18 @@ class ReviewWindow(QMainWindow):
 
     def _apply_logo(self) -> None:
         icon_path = None
-        if self.logo_path and self.logo_path.exists():
+        if self.logo_path and self.safe_path_exists(self.logo_path):
             icon_path = self.logo_path
         else:
             bundled = self.resource_dir / LOGO_FILE_NAME
-            if bundled.exists():
+            if self.safe_path_exists(bundled):
                 icon_path = bundled
                 self.logo_path = bundled
-        if icon_path and icon_path.exists():
+        if icon_path and self.safe_path_exists(icon_path):
             self.setWindowIcon(QIcon(str(icon_path)))
 
     def _update_logo_preview(self) -> None:
-        if self.logo_path and self.logo_path.exists():
+        if self.logo_path and self.safe_path_exists(self.logo_path):
             pixmap = QPixmap(str(self.logo_path))
             if not pixmap.isNull():
                 self.logo_preview.setPixmap(pixmap.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
@@ -788,20 +906,37 @@ class ReviewWindow(QMainWindow):
         self.moved_after_finish = False
         self.current_trim_in_ms = None
         self.current_trim_out_ms = None
+        self.last_queue_index = -1
+        self.pending_player_request_id += 1
+        self.waveform_cache.clear()
+        self.warmed_video_paths.clear()
+        self.reference_pixmap_cache.clear()
+        self.reference_match_cache.clear()
         self.refresh_reference_library_index()
         self.clear_reference_preview("暂无参考图")
 
-        if not self.source_dir.exists():
-            self.summary_label.setText(f"未找到源目录：{self.source_dir}")
-            self.log(f"未找到源目录：{self.source_dir}")
-            self.current_status.setText("状态：未找到源目录")
-            self.waveform_widget.clear("未找到源目录")
-            self.reference_info.setText("未找到源目录，无法匹配参考图。")
+        source_issue = self.get_source_dir_access_error()
+        if source_issue:
+            self.summary_label.setText(source_issue)
+            self.log(source_issue)
+            self.current_status.setText("状态：源目录不可用")
+            self.waveform_widget.clear("源目录不可用")
+            self.reference_info.setText("源目录不可用，无法匹配参考图。")
             return
 
-        files = self._collect_video_files(self.source_dir)
+        try:
+            files = self._collect_video_files(self.source_dir)
+        except Exception as exc:
+            message = f"扫描源目录失败：{self.source_dir}\n{exc}"
+            self.summary_label.setText(message)
+            self.log(message)
+            self.current_status.setText("状态：扫描源目录失败")
+            self.waveform_widget.clear("扫描源目录失败")
+            self.reference_info.setText("扫描源目录失败，无法匹配参考图。")
+            return
+
         for file_path in files:
-            relative_path = file_path.relative_to(self.source_dir)
+            relative_path = Path(self.safe_relative_text(file_path, self.source_dir))
             item = VideoItem(source_path=file_path, relative_path=relative_path)
             self.items.append(item)
             self.queue_list.addItem(QListWidgetItem(str(relative_path)))
@@ -816,19 +951,41 @@ class ReviewWindow(QMainWindow):
 
         self.review_active = True
         self.current_index = 0
-        self.update_queue_view()
+        self.update_queue_view(full_refresh=True)
         self.load_current_video()
         self.log(f"已加载 {len(self.items)} 个视频，准备开始审核。")
 
     def _collect_video_files(self, directory: Path) -> list[Path]:
         import re
-        files = [p for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS]
+
+        files: list[Path] = []
+        for root, dirnames, filenames in os.walk(directory, topdown=True, onerror=lambda e: None):
+            safe_dirnames: list[str] = []
+            root_path = Path(root)
+            for dirname in list(dirnames):
+                try:
+                    candidate = root_path / dirname
+                    if candidate.is_dir():
+                        safe_dirnames.append(dirname)
+                except OSError:
+                    continue
+            dirnames[:] = safe_dirnames
+
+            for filename in filenames:
+                try:
+                    candidate = root_path / filename
+                    if candidate.suffix.lower() in VIDEO_EXTENSIONS:
+                        files.append(candidate)
+                except OSError:
+                    continue
+
         def natural_sort_key(path: Path):
-            text = str(path.relative_to(directory))
+            text = self.safe_relative_text(path, directory)
             return [int(token) if token.isdigit() else token.lower() for token in re.split(r"(\d+)", text)]
+
         return sorted(files, key=natural_sort_key)
 
-    def update_queue_view(self) -> None:
+    def update_summary_label(self) -> None:
         total = len(self.items)
         pending = sum(1 for x in self.items if x.status is None)
         passed = sum(1 for x in self.items if x.status == "pass")
@@ -838,21 +995,44 @@ class ReviewWindow(QMainWindow):
         self.summary_label.setText(
             f"总数：{total}｜当前：{current}/{total}｜待审：{pending}｜通过：{passed}｜截断通过：{trimmed}｜不通过：{failed}"
         )
-        for idx, review_item in enumerate(self.items):
-            list_item = self.queue_list.item(idx)
-            if list_item is None:
-                continue
-            prefix = "[待审]"
-            if review_item.status == "pass":
-                prefix = "[通过]"
-            elif review_item.status == "fail":
-                prefix = "[不通过]"
-            elif review_item.status == "trim_pass":
-                prefix = "[截断通过]"
-            list_item.setText(f"{prefix} {review_item.relative_path}")
-            list_item.setSelected(idx == self.current_index)
-            if idx == self.current_index:
-                self.queue_list.scrollToItem(list_item)
+
+    def _queue_item_prefix(self, review_item: VideoItem) -> str:
+        if review_item.status == "pass":
+            return "[通过]"
+        if review_item.status == "fail":
+            return "[不通过]"
+        if review_item.status == "trim_pass":
+            return "[截断通过]"
+        return "[待审]"
+
+    def refresh_queue_row(self, idx: int) -> None:
+        if not (0 <= idx < len(self.items)):
+            return
+        list_item = self.queue_list.item(idx)
+        if list_item is None:
+            return
+        review_item = self.items[idx]
+        list_item.setText(f"{self._queue_item_prefix(review_item)} {review_item.relative_path}")
+        list_item.setSelected(idx == self.current_index)
+        if idx == self.current_index:
+            self.queue_list.scrollToItem(list_item)
+
+    def update_queue_view(self, full_refresh: bool = False) -> None:
+        self.update_summary_label()
+        if full_refresh:
+            self.queue_list.setUpdatesEnabled(False)
+            try:
+                for idx in range(len(self.items)):
+                    self.refresh_queue_row(idx)
+            finally:
+                self.queue_list.setUpdatesEnabled(True)
+            self.last_queue_index = self.current_index
+            return
+
+        indices = {idx for idx in {self.last_queue_index, self.current_index} if 0 <= idx < len(self.items)}
+        for idx in sorted(indices):
+            self.refresh_queue_row(idx)
+        self.last_queue_index = self.current_index
 
     def load_current_video(self) -> None:
         if not (0 <= self.current_index < len(self.items)):
@@ -863,6 +1043,7 @@ class ReviewWindow(QMainWindow):
             self.time_label.setText("00:00 / 00:00")
             self.waveform_widget.clear("审核结束")
             self.clear_reference_preview("审核结束")
+            self.pending_player_request_id += 1
             self.player.stop()
             return
 
@@ -884,36 +1065,121 @@ class ReviewWindow(QMainWindow):
         self.position_slider.setValue(0)
         self.position_slider.blockSignals(False)
         self.time_label.setText("00:00 / 00:00")
-        self.waveform_widget.clear("波形加载中...")
+        self.waveform_delay_timer.stop()
+        cached_peaks = self.waveform_cache.get(str(item.source_path))
+        if cached_peaks is not None:
+            self.waveform_widget.set_peaks(cached_peaks, "当前视频没有可显示的音频波形")
+        else:
+            self.waveform_widget.clear("波形准备中...")
         self.refresh_selection_label()
         self.update_waveform_selection()
-        self.player.setSource(QUrl.fromLocalFile(str(item.source_path)))
-        self.player.play()
-        self.update_queue_view()
+        self.update_queue_view(full_refresh=False)
         self.statusBar().showMessage(f"正在播放：{item.relative_path}")
-        self.start_waveform_loading(item.source_path)
+        self.schedule_waveform_loading(item.source_path)
         self.update_reference_preview_for_item(item)
 
+        self.pending_player_request_id += 1
+        request_id = self.pending_player_request_id
+        source_path = item.source_path
+        QTimer.singleShot(0, lambda request_id=request_id, source_path=source_path: self.apply_pending_video_source(request_id, source_path))
+        self.next_video_prefetch_timer.start(260)
+
+    def apply_pending_video_source(self, request_id: int, source_path: Path) -> None:
+        if request_id != self.pending_player_request_id:
+            return
+        if not (0 <= self.current_index < len(self.items)):
+            return
+        current_item = self.items[self.current_index]
+        if current_item.source_path != source_path:
+            return
+        self.player.setSource(QUrl.fromLocalFile(str(source_path)))
+        self.player.play()
+
+    def _start_file_warmup_thread(self, video_path: Path) -> None:
+        source_text = str(video_path)
+        if source_text in self.warmed_video_paths or source_text in self.file_warm_threads:
+            return
+        thread = FileWarmupThread(video_path)
+        thread.finished_warmup.connect(self.on_file_warm_finished)
+        thread.finished.connect(lambda source_text=source_text: self._cleanup_file_warm_thread(source_text))
+        self.file_warm_threads[source_text] = thread
+        thread.start(QThread.Priority.LowPriority)
+
+    def _cleanup_file_warm_thread(self, source_text: str) -> None:
+        thread = self.file_warm_threads.pop(source_text, None)
+        if thread is not None:
+            thread.deleteLater()
+
+    @Slot(str)
+    def on_file_warm_finished(self, source_text: str) -> None:
+        self.warmed_video_paths.add(source_text)
+
+    def schedule_waveform_loading(self, video_path: Path) -> None:
+        source_path = str(video_path)
+        self.waveform_request_path = source_path
+        if source_path in self.waveform_cache:
+            self.waveform_widget.set_peaks(self.waveform_cache[source_path], "当前视频没有可显示的音频波形")
+            self.update_waveform_selection()
+            return
+        self.waveform_delay_timer.stop()
+        self.waveform_delay_timer.start(320)
+
+    def load_delayed_waveform_for_current(self) -> None:
+        if not (0 <= self.current_index < len(self.items)):
+            return
+        current_item = self.items[self.current_index]
+        self.start_waveform_loading(current_item.source_path)
+
+    def _start_waveform_thread(self, video_path: Path) -> None:
+        source_path = str(video_path)
+        if source_path in self.waveform_threads or source_path in self.waveform_cache:
+            return
+        thread = WaveformThread(video_path)
+        thread.finished_waveform.connect(self.on_waveform_ready)
+        thread.finished.connect(lambda source_path=source_path: self._cleanup_waveform_thread(source_path))
+        self.waveform_threads[source_path] = thread
+        self.waveform_thread = thread
+        thread.start(QThread.Priority.LowPriority)
+
+    def _cleanup_waveform_thread(self, source_path: str) -> None:
+        thread = self.waveform_threads.pop(source_path, None)
+        if thread is not None:
+            thread.deleteLater()
+
     def start_waveform_loading(self, video_path: Path) -> None:
-        if self.waveform_thread and self.waveform_thread.isRunning():
-            self.waveform_thread.finished_waveform.disconnect(self.on_waveform_ready)
-            self.waveform_thread.requestInterruption()
-            self.waveform_thread.quit()
-            self.waveform_thread.wait(100)
-        self.waveform_request_path = str(video_path)
+        source_path = str(video_path)
+        self.waveform_request_path = source_path
+        cached_peaks = self.waveform_cache.get(source_path)
+        if cached_peaks is not None:
+            self.waveform_widget.set_peaks(cached_peaks, "当前视频没有可显示的音频波形")
+            self.update_waveform_selection()
+            return
         self.waveform_widget.clear("波形加载中...")
-        self.waveform_thread = WaveformThread(video_path)
-        self.waveform_thread.finished_waveform.connect(self.on_waveform_ready)
-        self.waveform_thread.start()
+        self._start_waveform_thread(video_path)
+
+    def prefetch_waveform(self, video_path: Path) -> None:
+        self._start_waveform_thread(video_path)
+
+    def prefetch_next_video_assets(self) -> None:
+        for offset in (1, 2):
+            next_index = self.current_index + offset
+            if not (0 <= next_index < len(self.items)):
+                continue
+            next_item = self.items[next_index]
+            self._start_file_warmup_thread(next_item.source_path)
+            self.prefetch_reference_for_item(next_item)
 
     @Slot(str, object, str)
     def on_waveform_ready(self, source_path: str, peaks: object, error_text: str) -> None:
+        if error_text:
+            if source_path == self.waveform_request_path:
+                self.waveform_widget.set_status(f"波形加载失败：{error_text}")
+            return
+        peaks_list = list(peaks)
+        self.waveform_cache[source_path] = peaks_list
         if source_path != self.waveform_request_path:
             return
-        if error_text:
-            self.waveform_widget.set_status(f"波形加载失败：{error_text}")
-            return
-        self.waveform_widget.set_peaks(list(peaks), "当前视频没有可显示的音频波形")
+        self.waveform_widget.set_peaks(peaks_list, "当前视频没有可显示的音频波形")
         self.update_waveform_selection()
 
     def on_duration_changed(self, duration: int) -> None:
@@ -956,7 +1222,7 @@ class ReviewWindow(QMainWindow):
         next_idx = self.current_index + 1
         if next_idx < len(self.items):
             self.current_index = next_idx
-            self.load_current_video()
+            QTimer.singleShot(0, self.load_current_video)
             return
         self.finish_review(auto_finished=True)
 
@@ -1046,8 +1312,8 @@ class ReviewWindow(QMainWindow):
         ffmpeg_exe = get_ffmpeg_exe()
         target_relative = item.relative_path.with_suffix(".mp4")
         target_path = self.pass_dir / target_relative
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        if target_path.exists():
+        self.safe_ensure_dir(target_path.parent)
+        if self.safe_path_exists(target_path):
             target_path = self._make_unique_path(target_path)
 
         start_sec = f"{start_ms / 1000:.3f}"
@@ -1077,7 +1343,7 @@ class ReviewWindow(QMainWindow):
             "+faststart",
             str(target_path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, **get_hidden_subprocess_kwargs())
         if result.returncode != 0:
             error_text = (result.stderr or result.stdout or "未知错误").strip()
             raise RuntimeError(error_text)
@@ -1094,12 +1360,12 @@ class ReviewWindow(QMainWindow):
         item = self.items[self.current_index]
         self.reset_item_review(item, remove_generated_clip=True)
         self.log(f"返回上一条重审：{item.relative_path}")
-        self.load_current_video()
+        QTimer.singleShot(0, self.load_current_video)
 
     def reset_item_review(self, item: VideoItem, remove_generated_clip: bool) -> None:
-        if remove_generated_clip and item.clip_output_path and item.clip_output_path.exists():
+        if remove_generated_clip and item.clip_output_path and self.safe_path_exists(item.clip_output_path):
             try:
-                item.clip_output_path.unlink()
+                self.safe_unlink(item.clip_output_path)
                 self.log(f"已删除旧裁剪结果：{item.clip_output_path}")
             except Exception as exc:
                 self.log(f"删除旧裁剪结果失败：{item.clip_output_path} -> {exc}")
@@ -1114,10 +1380,13 @@ class ReviewWindow(QMainWindow):
             self.close()
             return
         self.review_active = False
+        self.next_video_prefetch_timer.stop()
+        self.waveform_delay_timer.stop()
+        self.pending_player_request_id += 1
         self.player.stop()
         moved_count = self.apply_moves()
         self.moved_after_finish = True
-        self.update_queue_view()
+        self.update_queue_view(full_refresh=True)
 
         pending = sum(1 for x in self.items if x.status is None)
         passed = sum(1 for x in self.items if x.status == "pass")
@@ -1125,17 +1394,12 @@ class ReviewWindow(QMainWindow):
         trimmed = sum(1 for x in self.items if x.status == "trim_pass")
 
         msg = (
-            f"审核结束。\n\n"
-            f"通过：{passed}\n"
-            f"截断通过：{trimmed}\n"
-            f"不通过：{failed}\n"
-            f"未处理：{pending}\n"
-            f"已移动源文件：{moved_count}\n\n"
-            f"说明：截断通过生成的新视频已直接保存到通过目录，原始文件默认保留在源目录。"
+            f"审核结束｜通过：{passed}｜截断通过：{trimmed}｜不通过：{failed}｜未处理：{pending}｜已移动：{moved_count}"
         )
-        QMessageBox.information(self, "审核完成" if auto_finished else "审核结束", msg)
+        self.log(msg)
+        self.log("说明：截断通过生成的新视频已直接保存到通过目录，原始文件默认保留在源目录。")
         self.current_status.setText("状态：审核结束，已按记录处理")
-        self.statusBar().showMessage("审核已结束。", 5000)
+        self.statusBar().showMessage(msg, 8000)
 
     def apply_moves(self) -> int:
         moved = 0
@@ -1144,13 +1408,21 @@ class ReviewWindow(QMainWindow):
                 continue
             target_root = self.pass_dir if item.status == "pass" else self.fail_dir
             target_path = target_root / item.relative_path
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            if not item.source_path.exists():
-                self.log(f"跳过（源文件不存在）：{item.relative_path}")
+            try:
+                self.safe_ensure_dir(target_path.parent)
+            except Exception as exc:
+                self.log(f"跳过（目标目录不可用）：{item.relative_path} -> {exc}")
                 continue
-            if target_path.exists():
+            if not self.safe_path_exists(item.source_path):
+                self.log(f"跳过（源文件不存在或不可访问）：{item.relative_path}")
+                continue
+            if self.safe_path_exists(target_path):
                 target_path = self._make_unique_path(target_path)
-            shutil.move(str(item.source_path), str(target_path))
+            try:
+                shutil.move(str(item.source_path), str(target_path))
+            except Exception as exc:
+                self.log(f"移动失败：{item.relative_path} -> {target_path} -> {exc}")
+                continue
             moved += 1
             self.log(f"已移动：{item.relative_path} -> {target_path}")
         return moved
@@ -1162,7 +1434,7 @@ class ReviewWindow(QMainWindow):
         parent = path.parent
         idx = 1
         candidate = path
-        while candidate.exists():
+        while ReviewWindow.safe_path_exists(candidate):
             candidate = parent / f"{stem}_{idx}{suffix}"
             idx += 1
         return candidate
@@ -1221,7 +1493,7 @@ class ReviewWindow(QMainWindow):
             return
         self.current_index = row
         self.log(f"跳转到：{self.items[row].relative_path}")
-        self.load_current_video()
+        QTimer.singleShot(0, self.load_current_video)
 
     def reload_and_reset(self) -> None:
         if self.items and not self.moved_after_finish:
@@ -1234,21 +1506,57 @@ class ReviewWindow(QMainWindow):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
+        self.next_video_prefetch_timer.stop()
+        self.waveform_delay_timer.stop()
+        self.pending_player_request_id += 1
         self.player.stop()
         self.log("重新加载目录并重置审核记录。")
         self._load_videos()
 
     def refresh_reference_library_index(self) -> None:
-        if not self.product_library_dir.exists():
-            self.reference_library_images = []
+        self.reference_library_images = []
+        self.reference_library_records = []
+        self.reference_library_error_text = ""
+        self.reference_match_cache.clear()
+        self.reference_pixmap_cache.clear()
+
+        access_error = self.get_product_library_access_error()
+        if access_error:
+            self.reference_library_error_text = access_error
             return
-        self.reference_library_images = sorted(
-            [
-                path for path in self.product_library_dir.rglob("*")
-                if path.is_file() and path.suffix.lower() in REFERENCE_IMAGE_EXTENSIONS
-            ],
-            key=lambda path: str(path.relative_to(self.product_library_dir)).lower(),
-        )
+
+        if not self.safe_path_exists(self.product_library_dir):
+            return
+
+        try:
+            images: list[Path] = []
+            records: list[tuple[Path, str, str, str, str]] = []
+            for path in self.product_library_dir.rglob("*"):
+                try:
+                    if path.is_file() and path.suffix.lower() in REFERENCE_IMAGE_EXTENSIONS:
+                        relative_text = self.safe_relative_text(path, self.product_library_dir)
+                        images.append(path)
+                        records.append(
+                            (
+                                path,
+                                relative_text.lower(),
+                                self._normalize_reference_text(relative_text),
+                                self._normalize_reference_text(path.parent.name),
+                                self._normalize_reference_text(path.stem),
+                            )
+                        )
+                except OSError:
+                    continue
+            combined = sorted(
+                zip(images, records),
+                key=lambda row: row[1][1],
+            )
+            self.reference_library_images = [row[0] for row in combined]
+            self.reference_library_records = [row[1] for row in combined]
+        except OSError as exc:
+            self.reference_library_images = []
+            self.reference_library_records = []
+            self.reference_library_error_text = f"产品库目录暂时无法访问：{self.product_library_dir}\n{exc}"
 
     def clear_reference_preview(self, info_text: str) -> None:
         self.current_reference_product_key = None
@@ -1316,48 +1624,74 @@ class ReviewWindow(QMainWindow):
         return candidates
 
     def find_reference_images_for_item(self, item: VideoItem) -> tuple[str, list[Path]]:
-        if not self.reference_library_images:
+        if not self.reference_library_records:
             return self.derive_product_key(item), []
 
         candidates = self.derive_reference_candidates(item)
-        candidate_norms = [self._normalize_reference_text(candidate) for candidate in candidates]
+        candidate_pairs = [
+            (candidate, self._normalize_reference_text(candidate))
+            for candidate in candidates
+            if self._normalize_reference_text(candidate)
+        ]
+        cache_key = tuple(candidate_norm for _, candidate_norm in candidate_pairs)
+        if cache_key in self.reference_match_cache:
+            return self.reference_match_cache[cache_key]
+
         scored: list[tuple[int, str, Path]] = []
-        for image_path in self.reference_library_images:
-            relative_text = str(image_path.relative_to(self.product_library_dir))
-            path_norm = self._normalize_reference_text(relative_text)
-            parent_norm = self._normalize_reference_text(image_path.parent.name)
-            stem_norm = self._normalize_reference_text(image_path.stem)
+        for image_path, relative_text_lower, path_norm, parent_norm, stem_norm in self.reference_library_records:
             score = 0
-            matched_name = ""
-            for candidate, candidate_norm in zip(candidates, candidate_norms):
-                if not candidate_norm:
-                    continue
+            for candidate, candidate_norm in candidate_pairs:
                 if parent_norm == candidate_norm:
                     score = max(score, 120)
-                    matched_name = candidate
                 elif stem_norm == candidate_norm:
                     score = max(score, 100)
-                    matched_name = candidate
-                elif candidate_norm and candidate_norm in parent_norm:
+                elif candidate_norm in parent_norm:
                     score = max(score, 80)
-                    matched_name = candidate
-                elif candidate_norm and candidate_norm in path_norm:
+                elif candidate_norm in path_norm:
                     score = max(score, 60)
-                    matched_name = candidate
             if score > 0:
-                scored.append((score, relative_text.lower(), image_path))
+                scored.append((score, relative_text_lower, image_path))
 
         if not scored:
-            return self.derive_product_key(item), []
+            result = (self.derive_product_key(item), [])
+            self.reference_match_cache[cache_key] = result
+            return result
 
         scored.sort(key=lambda row: (-row[0], row[1]))
         images = [row[2] for row in scored]
         product_key = self.derive_product_key(item)
-        for candidate in candidates:
-            if any(self._normalize_reference_text(candidate) in self._normalize_reference_text(str(path.parent.name)) or self._normalize_reference_text(candidate) == self._normalize_reference_text(path.parent.name) for path in images):
+        for candidate, candidate_norm in candidate_pairs:
+            if any(
+                candidate_norm in self._normalize_reference_text(path.parent.name)
+                or candidate_norm == self._normalize_reference_text(path.parent.name)
+                for path in images
+            ):
                 product_key = candidate
                 break
-        return product_key, images
+        result = (product_key, images)
+        self.reference_match_cache[cache_key] = result
+        return result
+
+    def get_saved_reference_index(self, product_key: str, images: list[Path]) -> int:
+        saved_path = self.reference_selection_map.get(product_key, "")
+        if saved_path:
+            for idx, image_path in enumerate(images):
+                if str(image_path) == saved_path:
+                    return idx
+        return 0
+
+    def prefetch_reference_for_item(self, item: VideoItem) -> None:
+        product_key, images = self.find_reference_images_for_item(item)
+        if not images:
+            return
+        selected_index = self.get_saved_reference_index(product_key, images)
+        image_path = images[selected_index]
+        cache_key = str(image_path)
+        if cache_key in self.reference_pixmap_cache:
+            return
+        pixmap = QPixmap(str(image_path))
+        if not pixmap.isNull():
+            self.reference_pixmap_cache[cache_key] = pixmap
 
     def render_reference_pixmap(self) -> None:
         if self.reference_image_original_pixmap is None or self.reference_image_original_pixmap.isNull():
@@ -1377,7 +1711,12 @@ class ReviewWindow(QMainWindow):
             return
         index %= len(self.current_reference_images)
         image_path = self.current_reference_images[index]
-        pixmap = QPixmap(str(image_path))
+        cache_key = str(image_path)
+        pixmap = self.reference_pixmap_cache.get(cache_key)
+        if pixmap is None or pixmap.isNull():
+            pixmap = QPixmap(str(image_path))
+            if not pixmap.isNull():
+                self.reference_pixmap_cache[cache_key] = pixmap
         if pixmap.isNull():
             self.reference_image_original_pixmap = None
             self.reference_image_label.setPixmap(QPixmap())
@@ -1391,7 +1730,7 @@ class ReviewWindow(QMainWindow):
         self.render_reference_pixmap()
 
         relative_path = image_path
-        if self.product_library_dir.exists():
+        if self.safe_path_exists(self.product_library_dir):
             try:
                 relative_path = image_path.relative_to(self.product_library_dir)
             except ValueError:
@@ -1408,8 +1747,15 @@ class ReviewWindow(QMainWindow):
             self.save_config()
 
     def update_reference_preview_for_item(self, item: VideoItem) -> None:
-        if not self.product_library_dir.exists():
+        access_error = self.get_product_library_access_error()
+        if access_error:
+            self.clear_reference_preview(access_error)
+            return
+        if not self.safe_path_exists(self.product_library_dir):
             self.clear_reference_preview(f"未找到产品库目录：{self.product_library_dir}")
+            return
+        if self.reference_library_error_text:
+            self.clear_reference_preview(self.reference_library_error_text)
             return
 
         product_key, images = self.find_reference_images_for_item(item)
@@ -1427,14 +1773,7 @@ class ReviewWindow(QMainWindow):
             )
             return
 
-        saved_path = self.reference_selection_map.get(product_key, "")
-        selected_index = 0
-        if saved_path:
-            for idx, image_path in enumerate(images):
-                if str(image_path) == saved_path:
-                    selected_index = idx
-                    break
-
+        selected_index = self.get_saved_reference_index(product_key, images)
         self.set_reference_image_by_index(selected_index, persist=False)
 
     @Slot()
@@ -1500,6 +1839,8 @@ class ReviewWindow(QMainWindow):
         self.log_text.append(message)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self.next_video_prefetch_timer.stop()
+        self.pending_player_request_id += 1
         if self.items and not self.moved_after_finish and self.review_active:
             reply = QMessageBox.question(
                 self,
@@ -1550,7 +1891,7 @@ def extract_waveform_peaks(video_path: Path, bins: int = 900, sample_rate: int =
         "s16le",
         "-",
     ]
-    process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **get_hidden_subprocess_kwargs())
     if process.returncode != 0:
         stderr = process.stderr.decode("utf-8", errors="ignore").strip()
         raise RuntimeError(stderr or "ffmpeg 提取音频失败")
