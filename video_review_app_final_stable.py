@@ -1397,15 +1397,29 @@ class ReviewWindow(QMainWindow):
             f"审核结束｜通过：{passed}｜截断通过：{trimmed}｜不通过：{failed}｜未处理：{pending}｜已移动：{moved_count}"
         )
         self.log(msg)
-        self.log("说明：截断通过生成的新视频已直接保存到通过目录，原始文件默认保留在源目录。")
+        self.log("说明：截断通过生成的新视频已直接保存到通过目录；审核结束时，对应源文件会从分镜生成中删除。")
         self.current_status.setText("状态：审核结束，已按记录处理")
         self.statusBar().showMessage(msg, 8000)
 
     def apply_moves(self) -> int:
         moved = 0
         for item in self.items:
-            if item.status not in {"pass", "fail"}:
+            if item.status not in {"pass", "fail", "trim_pass"}:
                 continue
+
+            if item.status == "trim_pass":
+                if not self.safe_path_exists(item.source_path):
+                    self.log(f"跳过（源文件不存在或不可访问）：{item.relative_path}")
+                    continue
+                try:
+                    self.safe_unlink(item.source_path)
+                except Exception as exc:
+                    self.log(f"删除源文件失败：{item.relative_path} -> {exc}")
+                    continue
+                moved += 1
+                self.log(f"已删除源文件（截断通过已生成新片段）：{item.relative_path}")
+                continue
+
             target_root = self.pass_dir if item.status == "pass" else self.fail_dir
             target_path = target_root / item.relative_path
             try:
