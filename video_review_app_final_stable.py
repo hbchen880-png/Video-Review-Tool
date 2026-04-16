@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QCheckBox,
     QKeySequenceEdit,
     QLineEdit,
     QListWidget,
@@ -42,9 +43,12 @@ SOURCE_DIR_NAME = "分镜生成"
 PASS_DIR_NAME = "审核通过"
 FAIL_DIR_NAME = "不合格视频"
 PRODUCT_LIBRARY_DIR_NAME = "产品库"
+COPY_LIBRARY_DIR_NAME = "文案库"
+FINISHED_REPOSITORY_DIR_NAME = "成品仓库"
 CONFIG_FILE_NAME = "review_config.json"
 LOGO_FILE_NAME = "app_logo.png"
 REFERENCE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+COPY_LIBRARY_EXTENSIONS = {".txt", ".md"}
 
 DEFAULT_SHORTCUTS = {
     "pass": "V",
@@ -253,13 +257,14 @@ class SettingsDialog(QDialog):
         pass_dir: Path,
         fail_dir: Path,
         product_library_dir: Path,
+        rename_to_finished_repo: bool,
         shortcuts: dict[str, str],
         logo_path: Optional[Path],
     ) -> None:
         super().__init__(parent)
         self.base_dir = base_dir
         self.setWindowTitle("设置")
-        self.resize(860, 420)
+        self.resize(900, 500)
 
         root = QVBoxLayout(self)
         form = QFormLayout()
@@ -277,6 +282,10 @@ class SettingsDialog(QDialog):
         form.addRow("通过目录", pass_row)
         form.addRow("不通过目录", fail_row)
         form.addRow("产品库目录", product_library_row)
+        self.rename_to_finished_repo_check = QCheckBox("启用")
+        self.rename_to_finished_repo_check.setChecked(rename_to_finished_repo)
+        self.rename_to_finished_repo_check.setToolTip("开启后，审核通过的视频会按根目录下“文案库”的文案重命名，并放入根目录下“成品仓库”的对应文件夹。")
+        form.addRow("是否重命名后放入成品仓库", self.rename_to_finished_repo_check)
         form.addRow("Logo 图片", logo_row)
 
         shortcut_widget = QWidget()
@@ -314,7 +323,7 @@ class SettingsDialog(QDialog):
         form.addRow("快捷键", shortcut_widget)
         root.addLayout(form)
 
-        tip = QLabel("I：设置裁剪起点；O：把 I 到 O 的区间直接裁剪到通过目录。若未设置 I，则默认从 0 秒裁到 O。Z：切换当前产品参考图，切换后会记住。拖动时间条时会自动暂停并显示该帧。")
+        tip = QLabel("I：设置裁剪起点；O：把 I 到 O 的区间直接裁剪到通过目录。若未设置 I，则默认从 0 秒裁到 O。Z：切换当前产品参考图，切换后会记住。拖动时间条时会自动暂停并显示该帧。开启“重命名后放入成品仓库”后，会读取程序根目录下“文案库”的对应文案，一行文案对应一个成品文件名；若名字已在“成品仓库”对应文件夹中被占用，则自动跳过该文案，不会加后缀。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #666;")
         root.addWidget(tip)
@@ -378,6 +387,7 @@ class SettingsDialog(QDialog):
         self.pass_edit.setText(str(self.base_dir / PASS_DIR_NAME))
         self.fail_edit.setText(str(self.base_dir / FAIL_DIR_NAME))
         self.product_library_edit.setText(str(self.base_dir / PRODUCT_LIBRARY_DIR_NAME))
+        self.rename_to_finished_repo_check.setChecked(False)
         self.logo_edit.setText(str(self.base_dir / LOGO_FILE_NAME))
         self.pass_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["pass"]))
         self.fail_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["fail"]))
@@ -394,6 +404,7 @@ class SettingsDialog(QDialog):
             "pass_dir": self.pass_edit.text().strip(),
             "fail_dir": self.fail_edit.text().strip(),
             "product_library_dir": self.product_library_edit.text().strip(),
+            "rename_to_finished_repo": self.rename_to_finished_repo_check.isChecked(),
             "logo_path": self.logo_edit.text().strip(),
             "shortcuts": {
                 "pass": self.pass_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
@@ -454,6 +465,7 @@ class ReviewWindow(QMainWindow):
         self.pass_dir = self.base_dir / PASS_DIR_NAME
         self.fail_dir = self.base_dir / FAIL_DIR_NAME
         self.product_library_dir = self.base_dir / PRODUCT_LIBRARY_DIR_NAME
+        self.rename_to_finished_repo = False
         self.logo_path: Optional[Path] = None
         self.shortcuts_map = DEFAULT_SHORTCUTS.copy()
         self.reference_selection_map: dict[str, str] = {}
@@ -748,6 +760,7 @@ class ReviewWindow(QMainWindow):
         self.pass_dir = self.resolve_config_path(data.get("pass_dir"), self.base_dir / PASS_DIR_NAME)
         self.fail_dir = self.resolve_config_path(data.get("fail_dir"), self.base_dir / FAIL_DIR_NAME)
         self.product_library_dir = self.resolve_config_path(data.get("product_library_dir"), self.base_dir / PRODUCT_LIBRARY_DIR_NAME)
+        self.rename_to_finished_repo = bool(data.get("rename_to_finished_repo", False))
 
         logo_value = data.get("logo_path")
         if logo_value:
@@ -836,12 +849,38 @@ class ReviewWindow(QMainWindow):
         return self.describe_path_issue(self.fail_dir, "不通过目录")
 
 
+    def get_copy_library_dir(self) -> Path:
+        return self.base_dir / COPY_LIBRARY_DIR_NAME
+
+    def get_finished_repository_dir(self) -> Path:
+        return self.base_dir / FINISHED_REPOSITORY_DIR_NAME
+
+    def get_copy_library_access_error(self) -> str:
+        return self.describe_path_issue(self.get_copy_library_dir(), "文案库目录")
+
+    def get_finished_repository_access_error(self) -> str:
+        issue = self.describe_path_issue(self.get_finished_repository_dir(), "成品仓库目录")
+        if issue.startswith("未找到"):
+            return ""
+        return issue
+
+    @staticmethod
+    def safe_read_text_with_fallback(path: Path) -> str:
+        raw = path.read_bytes()
+        for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
+            try:
+                return raw.decode(encoding)
+            except Exception:
+                continue
+        return raw.decode("utf-8", errors="ignore")
+
     def save_config(self) -> None:
         data = {
             "source_dir": str(self.source_dir),
             "pass_dir": str(self.pass_dir),
             "fail_dir": str(self.fail_dir),
             "product_library_dir": str(self.product_library_dir),
+            "rename_to_finished_repo": self.rename_to_finished_repo,
             "logo_path": str(self.logo_path) if self.logo_path else "",
             "reference_selection_map": self.reference_selection_map,
             "shortcuts": self.shortcuts_map,
@@ -1402,6 +1441,11 @@ class ReviewWindow(QMainWindow):
         self.statusBar().showMessage(msg, 8000)
 
     def apply_moves(self) -> int:
+        if self.rename_to_finished_repo:
+            return self.apply_moves_with_repository_rename()
+        return self.apply_moves_standard()
+
+    def apply_moves_standard(self) -> int:
         moved = 0
         for item in self.items:
             if item.status not in {"pass", "fail", "trim_pass"}:
@@ -1439,6 +1483,282 @@ class ReviewWindow(QMainWindow):
                 continue
             moved += 1
             self.log(f"已移动：{item.relative_path} -> {target_path}")
+        return moved
+
+    def collect_existing_video_stems(self, target_dir: Path) -> set[str]:
+        used: set[str] = set()
+        if not self.safe_path_exists(target_dir) or not self.safe_path_is_dir(target_dir):
+            return used
+        try:
+            for path in target_dir.iterdir():
+                if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+                    used.add(path.stem.strip())
+        except OSError as exc:
+            raise RuntimeError(f"读取成品仓库目录失败：{target_dir}\n{exc}") from exc
+        return used
+
+    def sanitize_repository_filename(self, value: str) -> str:
+        if not value:
+            return ""
+        translated = value.translate(str.maketrans({
+            "<": "＜",
+            ">": "＞",
+            ":": "：",
+            '"': "”",
+            "/": "／",
+            "\\": "＼",
+            "|": "｜",
+            "?": "？",
+            "*": "＊",
+        }))
+        translated = re.sub(r"[\x00-\x1f]", " ", translated)
+        translated = re.sub(r"\s+", " ", translated).strip().rstrip(". ")
+        if len(translated) > 180:
+            translated = translated[:180].rstrip(". ")
+        return translated
+
+    def load_copy_library_records(self) -> list[tuple[Path, str, str, str, str]]:
+        copy_dir = self.get_copy_library_dir()
+        records: list[tuple[Path, str, str, str, str]] = []
+        if not self.safe_path_exists(copy_dir) or not self.safe_path_is_dir(copy_dir):
+            return records
+        try:
+            for path in copy_dir.rglob("*"):
+                if not path.is_file() or path.suffix.lower() not in COPY_LIBRARY_EXTENSIONS:
+                    continue
+                relative_text = self.safe_relative_text(path, copy_dir)
+                relative_lower = relative_text.lower()
+                parent_norm = self._normalize_reference_text(path.parent.name)
+                stem_norm = self._normalize_reference_text(path.stem)
+                path_norm = self._normalize_reference_text(relative_text)
+                records.append((path, relative_lower, parent_norm, stem_norm, path_norm))
+        except OSError as exc:
+            raise RuntimeError(f"扫描文案库失败：{copy_dir}\n{exc}") from exc
+        records.sort(key=lambda row: row[1])
+        return records
+
+    def find_copy_library_file_for_item(self, item: VideoItem) -> tuple[str, Optional[Path]]:
+        candidates = self.derive_reference_candidates(item)
+        candidate_pairs = [(candidate, self._normalize_reference_text(candidate)) for candidate in candidates]
+        records = self.load_copy_library_records()
+        if not records:
+            return self.derive_product_key(item), None
+
+        scored: list[tuple[int, str, Path, str]] = []
+        for path, relative_lower, parent_norm, stem_norm, path_norm in records:
+            score = 0
+            matched_name = ""
+            for candidate, candidate_norm in candidate_pairs:
+                if not candidate_norm:
+                    continue
+                if stem_norm == candidate_norm or parent_norm == candidate_norm:
+                    score = max(score, 120)
+                    matched_name = candidate
+                elif candidate_norm in stem_norm or candidate_norm in parent_norm:
+                    score = max(score, 90)
+                    matched_name = candidate
+                elif candidate_norm in path_norm:
+                    score = max(score, 70)
+                    matched_name = candidate
+            if score > 0:
+                scored.append((score, relative_lower, path, matched_name or self.derive_product_key(item)))
+
+        if not scored:
+            return self.derive_product_key(item), None
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        best = scored[0]
+        return best[3], best[2]
+
+    def read_copy_name_candidates(self, text_file: Path) -> list[str]:
+        text = self.safe_read_text_with_fallback(text_file)
+        names: list[str] = []
+        seen: set[str] = set()
+        for raw_line in text.splitlines():
+            cleaned = self.sanitize_repository_filename(raw_line)
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            names.append(cleaned)
+        return names
+
+    def move_item_to_standard_pass_dir(self, item: VideoItem) -> int:
+        target_path = self.pass_dir / item.relative_path
+        source_path = item.source_path
+        try:
+            self.safe_ensure_dir(target_path.parent)
+        except Exception as exc:
+            self.log(f"跳过（通过目录不可用）：{item.relative_path} -> {exc}")
+            return 0
+        if not self.safe_path_exists(source_path):
+            self.log(f"跳过（源文件不存在或不可访问）：{item.relative_path}")
+            return 0
+        if self.safe_path_exists(target_path):
+            target_path = self._make_unique_path(target_path)
+        try:
+            shutil.move(str(source_path), str(target_path))
+        except Exception as exc:
+            self.log(f"移动失败：{item.relative_path} -> {target_path} -> {exc}")
+            return 0
+        self.log(f"已回退到审核通过目录：{item.relative_path} -> {target_path}")
+        return 1
+
+    def keep_trimmed_clip_in_pass_dir_and_delete_source(self, item: VideoItem, reason: str) -> int:
+        if item.clip_output_path:
+            self.log(f"{reason}，截断片段保留在审核通过目录：{item.clip_output_path}")
+        if not self.safe_path_exists(item.source_path):
+            self.log(f"跳过（源文件不存在或不可访问）：{item.relative_path}")
+            return 0
+        try:
+            self.safe_unlink(item.source_path)
+        except Exception as exc:
+            self.log(f"删除源文件失败：{item.relative_path} -> {exc}")
+            return 0
+        self.log(f"已删除源文件（截断通过已生成新片段）：{item.relative_path}")
+        return 1
+
+    def apply_moves_with_repository_rename(self) -> int:
+        copy_dir = self.get_copy_library_dir()
+        finished_root = self.get_finished_repository_dir()
+        copy_issue = self.get_copy_library_access_error()
+        finished_issue = self.get_finished_repository_access_error()
+        if copy_issue and not copy_issue.startswith("未找到"):
+            self.log(f"文案库不可用，已回退为原始归档逻辑。\n{copy_issue}")
+            return self.apply_moves_standard()
+        if finished_issue:
+            self.log(f"成品仓库不可用，已回退为原始归档逻辑。\n{finished_issue}")
+            return self.apply_moves_standard()
+        if not self.safe_path_exists(copy_dir) or not self.safe_path_is_dir(copy_dir):
+            self.log(f"未找到文案库目录：{copy_dir}，已回退为原始归档逻辑。")
+            return self.apply_moves_standard()
+        try:
+            self.safe_ensure_dir(finished_root)
+        except Exception as exc:
+            self.log(f"成品仓库目录不可用，已回退为原始归档逻辑。\n{exc}")
+            return self.apply_moves_standard()
+
+        reserved_names_by_dir: dict[str, set[str]] = {}
+        moved = 0
+        for item in self.items:
+            if item.status not in {"pass", "fail", "trim_pass"}:
+                continue
+
+            if item.status == "fail":
+                target_path = self.fail_dir / item.relative_path
+                try:
+                    self.safe_ensure_dir(target_path.parent)
+                except Exception as exc:
+                    self.log(f"跳过（不通过目录不可用）：{item.relative_path} -> {exc}")
+                    continue
+                if not self.safe_path_exists(item.source_path):
+                    self.log(f"跳过（源文件不存在或不可访问）：{item.relative_path}")
+                    continue
+                if self.safe_path_exists(target_path):
+                    target_path = self._make_unique_path(target_path)
+                try:
+                    shutil.move(str(item.source_path), str(target_path))
+                except Exception as exc:
+                    self.log(f"移动失败：{item.relative_path} -> {target_path} -> {exc}")
+                    continue
+                moved += 1
+                self.log(f"已移动到不通过目录：{item.relative_path} -> {target_path}")
+                continue
+
+            approved_source_path = item.clip_output_path if item.status == "trim_pass" else item.source_path
+            if approved_source_path is None or not self.safe_path_exists(approved_source_path):
+                self.log(f"跳过（通过文件不存在或不可访问）：{item.relative_path}")
+                continue
+
+            product_key, text_file = self.find_copy_library_file_for_item(item)
+            if text_file is None:
+                reason = f"未在文案库中匹配到产品文案：{product_key}"
+                if item.status == "trim_pass":
+                    moved += self.keep_trimmed_clip_in_pass_dir_and_delete_source(item, reason)
+                else:
+                    self.log(reason)
+                    moved += self.move_item_to_standard_pass_dir(item)
+                continue
+
+            try:
+                name_candidates = self.read_copy_name_candidates(text_file)
+            except Exception as exc:
+                reason = f"读取文案库失败：{text_file} -> {exc}"
+                if item.status == "trim_pass":
+                    moved += self.keep_trimmed_clip_in_pass_dir_and_delete_source(item, reason)
+                else:
+                    self.log(reason)
+                    moved += self.move_item_to_standard_pass_dir(item)
+                continue
+
+            target_dir = finished_root / item.relative_path.parent
+            target_dir_key = str(target_dir)
+            try:
+                self.safe_ensure_dir(target_dir)
+            except Exception as exc:
+                reason = f"成品仓库目标目录不可用：{target_dir} -> {exc}"
+                if item.status == "trim_pass":
+                    moved += self.keep_trimmed_clip_in_pass_dir_and_delete_source(item, reason)
+                else:
+                    self.log(reason)
+                    moved += self.move_item_to_standard_pass_dir(item)
+                continue
+
+            if target_dir_key not in reserved_names_by_dir:
+                try:
+                    reserved_names_by_dir[target_dir_key] = self.collect_existing_video_stems(target_dir)
+                except Exception as exc:
+                    reason = str(exc)
+                    if item.status == "trim_pass":
+                        moved += self.keep_trimmed_clip_in_pass_dir_and_delete_source(item, reason)
+                    else:
+                        self.log(reason)
+                        moved += self.move_item_to_standard_pass_dir(item)
+                    continue
+
+            reserved = reserved_names_by_dir[target_dir_key]
+            selected_name = ""
+            for candidate in name_candidates:
+                if candidate not in reserved:
+                    selected_name = candidate
+                    break
+
+            if not selected_name:
+                reason = f"文案库已没有可用名称：{text_file.name}（成品仓库对应文件夹内名字都已被占用）"
+                if item.status == "trim_pass":
+                    moved += self.keep_trimmed_clip_in_pass_dir_and_delete_source(item, reason)
+                else:
+                    self.log(reason)
+                    moved += self.move_item_to_standard_pass_dir(item)
+                continue
+
+            reserved.add(selected_name)
+            target_path = target_dir / f"{selected_name}{approved_source_path.suffix.lower() or '.mp4'}"
+            try:
+                shutil.move(str(approved_source_path), str(target_path))
+            except Exception as exc:
+                reserved.discard(selected_name)
+                reason = f"移动到成品仓库失败：{approved_source_path} -> {target_path} -> {exc}"
+                if item.status == "trim_pass":
+                    moved += self.keep_trimmed_clip_in_pass_dir_and_delete_source(item, reason)
+                else:
+                    self.log(reason)
+                    moved += self.move_item_to_standard_pass_dir(item)
+                continue
+
+            if item.status == "trim_pass":
+                if not self.safe_path_exists(item.source_path):
+                    self.log(f"跳过（源文件不存在或不可访问）：{item.relative_path}")
+                else:
+                    try:
+                        self.safe_unlink(item.source_path)
+                    except Exception as exc:
+                        self.log(f"删除源文件失败：{item.relative_path} -> {exc}")
+                    else:
+                        self.log(f"已删除源文件（截断通过已生成新片段）：{item.relative_path}")
+                self.log(f"已按文案重命名并放入成品仓库：{approved_source_path} -> {target_path}（文案文件：{text_file.name}）")
+                moved += 1
+            else:
+                self.log(f"已按文案重命名并放入成品仓库：{item.relative_path} -> {target_path}（文案文件：{text_file.name}）")
+                moved += 1
         return moved
 
     @staticmethod
@@ -1815,6 +2135,7 @@ class ReviewWindow(QMainWindow):
             self.pass_dir,
             self.fail_dir,
             self.product_library_dir,
+            self.rename_to_finished_repo,
             self.shortcuts_map,
             self.logo_path,
         )
@@ -1827,6 +2148,7 @@ class ReviewWindow(QMainWindow):
         self.pass_dir = Path(values["pass_dir"])
         self.fail_dir = Path(values["fail_dir"])
         self.product_library_dir = Path(values["product_library_dir"])
+        self.rename_to_finished_repo = bool(values["rename_to_finished_repo"])
         logo_value = values["logo_path"].strip()
         self.logo_path = Path(logo_value) if logo_value else None
         self.shortcuts_map = values["shortcuts"]
