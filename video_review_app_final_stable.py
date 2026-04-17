@@ -16,6 +16,7 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -466,6 +467,7 @@ class ReviewWindow(QMainWindow):
         self.fail_dir = self.base_dir / FAIL_DIR_NAME
         self.product_library_dir = self.base_dir / PRODUCT_LIBRARY_DIR_NAME
         self.rename_to_finished_repo = False
+        self.playback_speed = 1.0
         self.logo_path: Optional[Path] = None
         self.shortcuts_map = DEFAULT_SHORTCUTS.copy()
         self.reference_selection_map: dict[str, str] = {}
@@ -610,6 +612,25 @@ class ReviewWindow(QMainWindow):
         self.waveform_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.waveform_widget.seek_requested.connect(self.on_waveform_seek_requested)
 
+        self.playback_speed_label = QLabel("播放速度")
+        self.playback_speed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.playback_speed_label.setStyleSheet("color:#666;")
+        self.playback_speed_spin = QDoubleSpinBox()
+        self.playback_speed_spin.setRange(0.25, 3.0)
+        self.playback_speed_spin.setSingleStep(0.05)
+        self.playback_speed_spin.setDecimals(2)
+        self.playback_speed_spin.setSuffix(" x")
+        self.playback_speed_spin.setFixedWidth(100)
+        self.playback_speed_spin.setValue(self.playback_speed)
+        self.playback_speed_spin.valueChanged.connect(self.on_playback_speed_changed)
+        speed_box = QWidget()
+        speed_box_layout = QVBoxLayout(speed_box)
+        speed_box_layout.setContentsMargins(0, 0, 0, 0)
+        speed_box_layout.setSpacing(4)
+        speed_box_layout.addWidget(self.playback_speed_label)
+        speed_box_layout.addWidget(self.playback_speed_spin, 0, Qt.AlignmentFlag.AlignHCenter)
+        speed_box_layout.addStretch(1)
+
         controls = QHBoxLayout()
         self.btn_pause = QPushButton()
         self.btn_mark_in = QPushButton()
@@ -646,6 +667,7 @@ class ReviewWindow(QMainWindow):
         timeline_grid.addWidget(self.position_slider, 0, 0)
         timeline_grid.addWidget(self.time_label, 0, 1)
         timeline_grid.addWidget(self.waveform_widget, 1, 0)
+        timeline_grid.addWidget(speed_box, 1, 1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
         timeline_grid.setColumnStretch(0, 1)
 
         center_panel.addWidget(self.video_title)
@@ -721,6 +743,7 @@ class ReviewWindow(QMainWindow):
         self.audio_output.setVolume(1.0)
         self.player.setAudioOutput(self.audio_output)
         self.player.setVideoOutput(self.video_widget)
+        self.player.setPlaybackRate(self.playback_speed)
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         self.player.errorOccurred.connect(self.on_player_error)
         self.player.durationChanged.connect(self.on_duration_changed)
@@ -761,6 +784,10 @@ class ReviewWindow(QMainWindow):
         self.fail_dir = self.resolve_config_path(data.get("fail_dir"), self.base_dir / FAIL_DIR_NAME)
         self.product_library_dir = self.resolve_config_path(data.get("product_library_dir"), self.base_dir / PRODUCT_LIBRARY_DIR_NAME)
         self.rename_to_finished_repo = bool(data.get("rename_to_finished_repo", False))
+        try:
+            self.playback_speed = max(0.25, min(3.0, float(data.get("playback_speed", 1.0))))
+        except (TypeError, ValueError):
+            self.playback_speed = 1.0
 
         logo_value = data.get("logo_path")
         if logo_value:
@@ -881,6 +908,7 @@ class ReviewWindow(QMainWindow):
             "fail_dir": str(self.fail_dir),
             "product_library_dir": str(self.product_library_dir),
             "rename_to_finished_repo": self.rename_to_finished_repo,
+            "playback_speed": self.playback_speed,
             "logo_path": str(self.logo_path) if self.logo_path else "",
             "reference_selection_map": self.reference_selection_map,
             "shortcuts": self.shortcuts_map,
@@ -935,7 +963,24 @@ class ReviewWindow(QMainWindow):
             f"通过目录：{self.pass_dir}｜不通过目录：{self.fail_dir}"
         )
         self.refresh_shortcut_texts()
+        if hasattr(self, "playback_speed_spin"):
+            self.playback_speed_spin.blockSignals(True)
+            self.playback_speed_spin.setValue(self.playback_speed)
+            self.playback_speed_spin.blockSignals(False)
         self._update_logo_preview()
+
+    @Slot(float)
+    def on_playback_speed_changed(self, value: float) -> None:
+        normalized = max(0.25, min(3.0, round(float(value), 2)))
+        self.playback_speed = normalized
+        if abs(self.playback_speed_spin.value() - normalized) > 0.001:
+            self.playback_speed_spin.blockSignals(True)
+            self.playback_speed_spin.setValue(normalized)
+            self.playback_speed_spin.blockSignals(False)
+        if hasattr(self, "player") and self.player is not None:
+            self.player.setPlaybackRate(normalized)
+        self.save_config()
+        self.statusBar().showMessage(f"播放速度已设置为 {normalized:.2f}x，后续视频将按此速度播放。", 2500)
 
     def _load_videos(self) -> None:
         self.items.clear()
@@ -1132,6 +1177,7 @@ class ReviewWindow(QMainWindow):
         if current_item.source_path != source_path:
             return
         self.player.setSource(QUrl.fromLocalFile(str(source_path)))
+        self.player.setPlaybackRate(self.playback_speed)
         self.player.play()
 
     def _start_file_warmup_thread(self, video_path: Path) -> None:
