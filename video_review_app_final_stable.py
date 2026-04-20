@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import re
@@ -534,7 +535,7 @@ class FlowLayout(QLayout):
 
 
 class ReviewWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, startup_review_groups: Optional[set[str]] = None, startup_request_label: str = "") -> None:
         super().__init__()
         self.base_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
         self.resource_dir = Path(getattr(sys, "_MEIPASS", self.base_dir))
@@ -595,6 +596,11 @@ class ReviewWindow(QMainWindow):
         self.group_filter_apply_timer.setInterval(350)
         self.group_filter_apply_timer.timeout.connect(self.apply_pending_group_filter_change)
 
+        self.startup_review_groups_pending = set(startup_review_groups or [])
+        self.startup_review_groups_original = set(startup_review_groups or [])
+        self.startup_request_label = startup_request_label
+        self.startup_review_groups_applied = False
+
         self._load_config()
 
         self.setWindowTitle("视频审核工具")
@@ -606,6 +612,8 @@ class ReviewWindow(QMainWindow):
         self._bind_shortcuts()
         self.refresh_settings_display()
         self._load_videos()
+        if self.startup_request_label and startup_review_groups:
+            self.statusBar().showMessage(f"已通过启动接口预选审核分组：{len(startup_review_groups)}组", 5000)
 
     def _resize_for_screen(self) -> None:
         screen = QApplication.primaryScreen()
@@ -1125,7 +1133,11 @@ class ReviewWindow(QMainWindow):
             self.refresh_group_filter_display()
             return
 
-        if not self.group_selection_has_saved_state:
+        if self.startup_review_groups_pending and not self.startup_review_groups_applied:
+            self.selected_review_groups = self.startup_review_groups_pending & available_set
+            self.group_selection_has_saved_state = True
+            self.startup_review_groups_applied = True
+        elif not self.group_selection_has_saved_state:
             self.selected_review_groups = set(self.available_review_groups)
             self.group_selection_has_saved_state = True
         else:
@@ -1271,8 +1283,17 @@ class ReviewWindow(QMainWindow):
             for file_path in all_files
         ]
         self.sync_review_group_selection(all_group_names)
-        selected_groups = self.selected_review_groups or set(self.available_review_groups)
+        selected_groups = set(self.selected_review_groups) if self.group_selection_has_saved_state else set(self.available_review_groups)
         self.applied_review_groups = set(selected_groups)
+
+        if self.startup_review_groups_original:
+            matched_groups = self.startup_review_groups_original & set(self.available_review_groups)
+            missing_groups = self.startup_review_groups_original - matched_groups
+            if matched_groups:
+                self.log(f"启动接口已预选审核分组：{'、'.join(self.natural_sort_strings(list(matched_groups)))}")
+            if missing_groups:
+                self.log(f"启动接口指定分组未匹配到：{'、'.join(self.natural_sort_strings(list(missing_groups)))}")
+            self.startup_review_groups_original = set()
 
         for file_path in all_files:
             relative_path = Path(self.safe_relative_text(file_path, self.source_dir))
@@ -1724,6 +1745,82 @@ class ReviewWindow(QMainWindow):
         item.trim_out_ms = None
         item.clip_output_path = None
 
+    def stop_waveform_thread_safely(self) -> None:
+        thread = getattr(self, "waveform_thread", None)
+        if thread is None:
+            return
+        try:
+            running = thread.isRunning()
+        except RuntimeError:
+            self.waveform_thread = None
+            return
+        if running:
+            try:
+                thread.finished_waveform.disconnect(self.on_waveform_ready)
+            except Exception:
+                pass
+            try:
+                thread.requestInterruption()
+            except Exception:
+                pass
+            try:
+                thread.quit()
+            except Exception:
+                pass
+            try:
+                thread.wait(120)
+            except Exception:
+                pass
+        self.waveform_thread = None
+
+    def ensure_source_removed_after_success(self, item: VideoItem, target_path: Optional[Path], reason: str) -> None:
+        if item.source_path is None:
+            return
+        if not self.safe_path_exists(item.source_path):
+            return
+        if target_path is not None and not self.safe_path_exists(target_path):
+            return
+        try:
+            self.release_current_media_file()
+        except Exception:
+            pass
+        last_error = None
+        for _ in range(3):
+            try:
+                self.safe_unlink(item.source_path)
+                self.log(f"已补删源文件：{item.relative_path}（{reason}）")
+                return
+            except Exception as exc:
+                last_error = exc
+                try:
+                    QApplication.processEvents()
+                    QThread.msleep(80)
+                except Exception:
+                    pass
+        if last_error is not None:
+            self.log(f"补删源文件失败：{item.relative_path}（{reason}） -> {last_error}")
+
+    def release_current_media_file(self) -> None:
+        try:
+            self.pending_player_request_id += 1
+            self.player.pause()
+        except Exception:
+            pass
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        try:
+            self.player.setSource(QUrl())
+        except Exception:
+            pass
+        try:
+            QApplication.processEvents()
+            QThread.msleep(80)
+            QApplication.processEvents()
+        except Exception:
+            pass
+
     @Slot(bool)
     def finish_review(self, auto_finished: bool = False) -> None:
         if self.moved_after_finish:
@@ -1732,8 +1829,8 @@ class ReviewWindow(QMainWindow):
         self.review_active = False
         self.next_video_prefetch_timer.stop()
         self.waveform_delay_timer.stop()
-        self.pending_player_request_id += 1
-        self.player.stop()
+        self.stop_waveform_thread_safely()
+        self.release_current_media_file()
         moved_count = self.apply_moves()
         self.moved_after_finish = True
         self.update_queue_view(full_refresh=True)
@@ -1770,7 +1867,9 @@ class ReviewWindow(QMainWindow):
                     self.safe_unlink(item.source_path)
                 except Exception as exc:
                     self.log(f"删除源文件失败：{item.relative_path} -> {exc}")
-                    continue
+                    self.ensure_source_removed_after_success(item, item.clip_output_path, "截断通过后统一收尾")
+                    if self.safe_path_exists(item.source_path):
+                        continue
                 moved += 1
                 self.log(f"已删除源文件（截断通过已生成新片段）：{item.relative_path}")
                 continue
@@ -1792,6 +1891,7 @@ class ReviewWindow(QMainWindow):
             except Exception as exc:
                 self.log(f"移动失败：{item.relative_path} -> {target_path} -> {exc}")
                 continue
+            self.ensure_source_removed_after_success(item, target_path, "移动成功后收尾")
             moved += 1
             self.log(f"已移动：{item.relative_path} -> {target_path}")
         return moved
@@ -1910,6 +2010,7 @@ class ReviewWindow(QMainWindow):
         except Exception as exc:
             self.log(f"移动失败：{item.relative_path} -> {target_path} -> {exc}")
             return 0
+        self.ensure_source_removed_after_success(item, target_path, "回退到审核通过目录后收尾")
         self.log(f"已回退到审核通过目录：{item.relative_path} -> {target_path}")
         return 1
 
@@ -1923,7 +2024,9 @@ class ReviewWindow(QMainWindow):
             self.safe_unlink(item.source_path)
         except Exception as exc:
             self.log(f"删除源文件失败：{item.relative_path} -> {exc}")
-            return 0
+            self.ensure_source_removed_after_success(item, item.clip_output_path, "保留裁剪片段后收尾")
+            if self.safe_path_exists(item.source_path):
+                return 0
         self.log(f"已删除源文件（截断通过已生成新片段）：{item.relative_path}")
         return 1
 
@@ -1970,6 +2073,7 @@ class ReviewWindow(QMainWindow):
                 except Exception as exc:
                     self.log(f"移动失败：{item.relative_path} -> {target_path} -> {exc}")
                     continue
+                self.ensure_source_removed_after_success(item, target_path, "不通过移动后收尾")
                 moved += 1
                 self.log(f"已移动到不通过目录：{item.relative_path} -> {target_path}")
                 continue
@@ -2063,11 +2167,13 @@ class ReviewWindow(QMainWindow):
                         self.safe_unlink(item.source_path)
                     except Exception as exc:
                         self.log(f"删除源文件失败：{item.relative_path} -> {exc}")
+                        self.ensure_source_removed_after_success(item, target_path, "截断通过放入成品仓库后收尾")
                     else:
                         self.log(f"已删除源文件（截断通过已生成新片段）：{item.relative_path}")
                 self.log(f"已按文案重命名并放入成品仓库：{approved_source_path} -> {target_path}（文案文件：{text_file.name}）")
                 moved += 1
             else:
+                self.ensure_source_removed_after_success(item, target_path, "成品仓库归档后收尾")
                 self.log(f"已按文案重命名并放入成品仓库：{item.relative_path} -> {target_path}（文案文件：{text_file.name}）")
                 moved += 1
         return moved
@@ -2560,9 +2666,51 @@ def extract_waveform_peaks(video_path: Path, bins: int = 900, sample_rate: int =
     return peaks
 
 
+def parse_group_names_text(text: str) -> list[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    normalized = raw.replace("；", ";").replace("，", ",").replace("｜", "|")
+    parts = re.split(r"[\n\r,;|]+", normalized)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def parse_launch_options(argv: list[str]) -> tuple[list[str], Optional[set[str]], str]:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--review-group", action="append", dest="review_groups", default=[], help="预选一个审核分组，可重复传入多次")
+    parser.add_argument("--review-groups", dest="review_groups_text", default="", help="预选多个审核分组，支持逗号/分号/竖线分隔，或 JSON 数组字符串")
+    parser.add_argument("--review-groups-file", dest="review_groups_file", default="", help="从文本或 JSON 文件读取要预选的审核分组")
+    args, qt_args = parser.parse_known_args(argv[1:])
+
+    groups: list[str] = []
+    groups.extend(str(item).strip() for item in (args.review_groups or []) if str(item).strip())
+    if args.review_groups_text:
+        groups.extend(parse_group_names_text(args.review_groups_text))
+    if args.review_groups_file:
+        try:
+            content = Path(args.review_groups_file).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            content = Path(args.review_groups_file).read_text(encoding="utf-8-sig")
+        groups.extend(parse_group_names_text(content))
+
+    unique_groups = list(dict.fromkeys(group for group in groups if group))
+    request_label = ""
+    if unique_groups:
+        request_label = "启动接口分组"
+        return [argv[0], *qt_args], set(unique_groups), request_label
+    return [argv[0], *qt_args], None, request_label
+
+
 def main() -> None:
-    app = QApplication(sys.argv)
-    window = ReviewWindow()
+    qt_argv, startup_review_groups, startup_request_label = parse_launch_options(sys.argv)
+    app = QApplication(qt_argv)
+    window = ReviewWindow(startup_review_groups=startup_review_groups, startup_request_label=startup_request_label)
     window.show()
     sys.exit(app.exec())
 
