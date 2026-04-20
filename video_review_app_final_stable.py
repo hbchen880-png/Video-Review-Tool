@@ -1156,9 +1156,10 @@ class ReviewWindow(QMainWindow):
             return
         total = len(self.available_review_groups)
         selected_count = len(self.selected_review_groups)
+        all_selected = total > 0 and selected_count >= total
         if total == 0:
             summary = "已选：暂无分组"
-        elif selected_count >= total:
+        elif all_selected:
             summary = f"已选：全部（{total}组）"
         elif selected_count == 0:
             summary = f"已选：0/{total}组"
@@ -1171,7 +1172,8 @@ class ReviewWindow(QMainWindow):
         self.group_filter_summary_label.setText(summary)
         self.group_select_all_button.setEnabled(total > 0)
         self.group_filter_updating = True
-        self.group_select_all_button.setChecked(total > 0 and selected_count >= total)
+        self.group_select_all_button.setChecked(all_selected)
+        self.group_select_all_button.setText("取消全选" if all_selected else "全选")
         for group, checkbox in self.group_checkbox_map.items():
             should_checked = group in self.selected_review_groups
             if checkbox.isChecked() != should_checked:
