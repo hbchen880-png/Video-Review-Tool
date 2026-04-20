@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QThread, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QPoint, QRect, QSize, QThread, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QLayout,
+    QLayoutItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -455,6 +457,82 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+class FlowLayout(QLayout):
+    def __init__(self, parent: Optional[QWidget] = None, margin: int = 0, hspacing: int = 8, vspacing: int = 8) -> None:
+        super().__init__(parent)
+        self._items: list[QLayoutItem] = []
+        self._hspacing = hspacing
+        self._vspacing = vspacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item: QLayoutItem) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> Optional[QLayoutItem]:
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int) -> Optional[QLayoutItem]:
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self) -> Qt.Orientations:
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        effective_rect = rect.adjusted(+margins.left(), +margins.top(), -margins.right(), -margins.bottom())
+        x = effective_rect.x()
+        y = effective_rect.y()
+        line_height = 0
+
+        for item in self._items:
+            widget = item.widget()
+            space_x = self._hspacing
+            space_y = self._vspacing
+            item_size = item.sizeHint()
+            next_x = x + item_size.width() + space_x
+            if next_x - space_x > effective_rect.right() and line_height > 0:
+                x = effective_rect.x()
+                y = y + line_height + space_y
+                next_x = x + item_size.width() + space_x
+                line_height = 0
+
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), item_size))
+
+            x = next_x
+            line_height = max(line_height, item_size.height())
+
+        return y + line_height - rect.y() + margins.bottom()
+
+
 class ReviewWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -468,6 +546,11 @@ class ReviewWindow(QMainWindow):
         self.product_library_dir = self.base_dir / PRODUCT_LIBRARY_DIR_NAME
         self.rename_to_finished_repo = False
         self.playback_speed = 1.0
+        self.available_review_groups: list[str] = []
+        self.selected_review_groups: set[str] = set()
+        self.applied_review_groups: set[str] = set()
+        self.group_checkbox_map: dict[str, QCheckBox] = {}
+        self.group_filter_updating = False
         self.logo_path: Optional[Path] = None
         self.shortcuts_map = DEFAULT_SHORTCUTS.copy()
         self.reference_selection_map: dict[str, str] = {}
@@ -506,6 +589,10 @@ class ReviewWindow(QMainWindow):
         self.waveform_delay_timer = QTimer(self)
         self.waveform_delay_timer.setSingleShot(True)
         self.waveform_delay_timer.timeout.connect(self.load_delayed_waveform_for_current)
+        self.group_filter_apply_timer = QTimer(self)
+        self.group_filter_apply_timer.setSingleShot(True)
+        self.group_filter_apply_timer.setInterval(350)
+        self.group_filter_apply_timer.timeout.connect(self.apply_pending_group_filter_change)
 
         self._load_config()
 
@@ -579,8 +666,29 @@ class ReviewWindow(QMainWindow):
         self.queue_list.itemDoubleClicked.connect(self.jump_to_item)
         self.summary_label = QLabel("未开始")
         self.summary_label.setWordWrap(True)
+        self.group_filter_title_label = QLabel("请选择审核分组：")
+        self.group_filter_title_label.setStyleSheet("font-weight:600;")
+        self.group_select_all_button = QPushButton("全选")
+        self.group_select_all_button.setCheckable(True)
+        self.group_select_all_button.setChecked(True)
+        self.group_select_all_button.toggled.connect(self.on_group_select_all_toggled)
+        group_filter_header = QHBoxLayout()
+        group_filter_header.setContentsMargins(0, 0, 0, 0)
+        group_filter_header.setSpacing(8)
+        group_filter_header.addWidget(self.group_filter_title_label)
+        group_filter_header.addWidget(self.group_select_all_button)
+        group_filter_header.addStretch(1)
+        self.group_filter_summary_label = QLabel("已选：全部")
+        self.group_filter_summary_label.setWordWrap(True)
+        self.group_filter_summary_label.setStyleSheet("color:#666;")
+        self.group_filter_widget = QWidget()
+        self.group_filter_flow_layout = FlowLayout(self.group_filter_widget, margin=0, hspacing=8, vspacing=6)
+        self.group_filter_widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         left_panel.addWidget(left_title)
         left_panel.addWidget(self.summary_label)
+        left_panel.addLayout(group_filter_header)
+        left_panel.addWidget(self.group_filter_widget)
+        left_panel.addWidget(self.group_filter_summary_label)
         left_panel.addWidget(self.queue_list, 1)
         left_container = QWidget()
         left_container.setLayout(left_panel)
@@ -788,6 +896,8 @@ class ReviewWindow(QMainWindow):
             self.playback_speed = max(0.25, min(3.0, float(data.get("playback_speed", 1.0))))
         except (TypeError, ValueError):
             self.playback_speed = 1.0
+        saved_groups = data.get("selected_review_groups") or []
+        self.selected_review_groups = {str(x) for x in saved_groups if str(x).strip()}
 
         logo_value = data.get("logo_path")
         if logo_value:
@@ -909,6 +1019,7 @@ class ReviewWindow(QMainWindow):
             "product_library_dir": str(self.product_library_dir),
             "rename_to_finished_repo": self.rename_to_finished_repo,
             "playback_speed": self.playback_speed,
+            "selected_review_groups": sorted(self.selected_review_groups),
             "logo_path": str(self.logo_path) if self.logo_path else "",
             "reference_selection_map": self.reference_selection_map,
             "shortcuts": self.shortcuts_map,
@@ -967,6 +1078,7 @@ class ReviewWindow(QMainWindow):
             self.playback_speed_spin.blockSignals(True)
             self.playback_speed_spin.setValue(self.playback_speed)
             self.playback_speed_spin.blockSignals(False)
+        self.refresh_group_filter_display()
         self._update_logo_preview()
 
     @Slot(float)
@@ -981,6 +1093,123 @@ class ReviewWindow(QMainWindow):
             self.player.setPlaybackRate(normalized)
         self.save_config()
         self.statusBar().showMessage(f"播放速度已设置为 {normalized:.2f}x，后续视频将按此速度播放。", 2500)
+
+    @staticmethod
+    def natural_sort_strings(values: list[str]) -> list[str]:
+        def sort_key(text: str):
+            return [int(token) if token.isdigit() else token.lower() for token in re.split(r"(\d+)", text)]
+        return sorted(values, key=sort_key)
+
+    @staticmethod
+    def derive_review_group_name(relative_path: Path) -> str:
+        first_text = relative_path.parts[0] if relative_path.parts else relative_path.stem
+        if "-" in first_text:
+            return first_text.split("-", 1)[0].strip() or first_text.strip()
+        if "－" in first_text:
+            return first_text.split("－", 1)[0].strip() or first_text.strip()
+        return first_text.strip() or relative_path.stem
+
+    def sync_review_group_selection(self, available_groups: list[str]) -> None:
+        self.available_review_groups = self.natural_sort_strings(list(dict.fromkeys(available_groups)))
+        if not self.available_review_groups:
+            self.selected_review_groups = set()
+            self.applied_review_groups = set()
+            self.rebuild_group_filter_checkboxes()
+            self.refresh_group_filter_display()
+            return
+        if not self.selected_review_groups:
+            self.selected_review_groups = set(self.available_review_groups)
+        else:
+            self.selected_review_groups &= set(self.available_review_groups)
+            if not self.selected_review_groups:
+                self.selected_review_groups = set(self.available_review_groups)
+        self.rebuild_group_filter_checkboxes()
+        self.refresh_group_filter_display()
+
+    def clear_group_filter_widgets(self) -> None:
+        if not hasattr(self, "group_filter_flow_layout"):
+            return
+        while self.group_filter_flow_layout.count():
+            item = self.group_filter_flow_layout.takeAt(0)
+            if item is None:
+                continue
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.group_checkbox_map.clear()
+
+    def rebuild_group_filter_checkboxes(self) -> None:
+        if not hasattr(self, "group_filter_flow_layout"):
+            return
+        self.group_filter_updating = True
+        self.clear_group_filter_widgets()
+        for group in self.available_review_groups:
+            checkbox = QCheckBox(group)
+            checkbox.setChecked(group in self.selected_review_groups)
+            checkbox.toggled.connect(self.on_group_checkbox_toggled)
+            self.group_filter_flow_layout.addWidget(checkbox)
+            self.group_checkbox_map[group] = checkbox
+        self.group_filter_updating = False
+
+    def refresh_group_filter_display(self) -> None:
+        if not hasattr(self, "group_filter_summary_label"):
+            return
+        total = len(self.available_review_groups)
+        selected_count = len(self.selected_review_groups)
+        if total == 0:
+            summary = "已选：暂无分组"
+        elif selected_count >= total:
+            summary = f"已选：全部（{total}组）"
+        elif selected_count == 0:
+            summary = f"已选：0/{total}组"
+        else:
+            selected_names = self.natural_sort_strings(list(self.selected_review_groups))
+            preview = "、".join(selected_names[:4])
+            if selected_count > 4:
+                preview += f" 等{selected_count}组"
+            summary = f"已选：{preview}"
+        self.group_filter_summary_label.setText(summary)
+        self.group_select_all_button.setEnabled(total > 0)
+        self.group_filter_updating = True
+        self.group_select_all_button.setChecked(total > 0 and selected_count >= total)
+        for group, checkbox in self.group_checkbox_map.items():
+            should_checked = group in self.selected_review_groups
+            if checkbox.isChecked() != should_checked:
+                checkbox.setChecked(should_checked)
+        self.group_filter_updating = False
+
+    @Slot(bool)
+    def on_group_select_all_toggled(self, checked: bool) -> None:
+        if self.group_filter_updating:
+            return
+        if not self.available_review_groups:
+            return
+        self.group_filter_updating = True
+        self.selected_review_groups = set(self.available_review_groups) if checked else set()
+        for group, checkbox in self.group_checkbox_map.items():
+            checkbox.setChecked(group in self.selected_review_groups)
+        self.group_filter_updating = False
+        self.refresh_group_filter_display()
+        self.schedule_group_filter_reload()
+
+    @Slot(bool)
+    def on_group_checkbox_toggled(self, checked: bool) -> None:
+        if self.group_filter_updating:
+            return
+        self.selected_review_groups = {group for group, checkbox in self.group_checkbox_map.items() if checkbox.isChecked()}
+        self.refresh_group_filter_display()
+        self.schedule_group_filter_reload()
+
+    def schedule_group_filter_reload(self) -> None:
+        if self.selected_review_groups == self.applied_review_groups:
+            return
+        self.group_filter_apply_timer.start()
+
+    def apply_pending_group_filter_change(self) -> None:
+        if self.selected_review_groups == self.applied_review_groups:
+            return
+        self.save_config()
+        self.reload_and_reset()
 
     def _load_videos(self) -> None:
         self.items.clear()
@@ -1006,10 +1235,13 @@ class ReviewWindow(QMainWindow):
             self.current_status.setText("状态：源目录不可用")
             self.waveform_widget.clear("源目录不可用")
             self.reference_info.setText("源目录不可用，无法匹配参考图。")
+            self.available_review_groups = []
+            self.selected_review_groups = set()
+            self.refresh_group_filter_display()
             return
 
         try:
-            files = self._collect_video_files(self.source_dir)
+            all_files = self._collect_video_files(self.source_dir)
         except Exception as exc:
             message = f"扫描源目录失败：{self.source_dir}\n{exc}"
             self.summary_label.setText(message)
@@ -1017,20 +1249,41 @@ class ReviewWindow(QMainWindow):
             self.current_status.setText("状态：扫描源目录失败")
             self.waveform_widget.clear("扫描源目录失败")
             self.reference_info.setText("扫描源目录失败，无法匹配参考图。")
+            self.available_review_groups = []
+            self.selected_review_groups = set()
+            self.refresh_group_filter_display()
             return
 
-        for file_path in files:
+        all_group_names = [
+            self.derive_review_group_name(Path(self.safe_relative_text(file_path, self.source_dir)))
+            for file_path in all_files
+        ]
+        self.sync_review_group_selection(all_group_names)
+        selected_groups = self.selected_review_groups or set(self.available_review_groups)
+        self.applied_review_groups = set(selected_groups)
+
+        for file_path in all_files:
             relative_path = Path(self.safe_relative_text(file_path, self.source_dir))
+            if self.derive_review_group_name(relative_path) not in selected_groups:
+                continue
             item = VideoItem(source_path=file_path, relative_path=relative_path)
             self.items.append(item)
             self.queue_list.addItem(QListWidgetItem(str(relative_path)))
 
-        if not self.items:
+        if not all_files:
             self.summary_label.setText("没有找到可审核视频。")
             self.current_status.setText("状态：没有视频")
             self.waveform_widget.clear("没有视频")
             self.reference_info.setText("当前没有视频。")
             self.log("源目录中没有找到视频文件。")
+            return
+
+        if not self.items:
+            self.summary_label.setText("当前所选分组下没有可审核视频。")
+            self.current_status.setText("状态：筛选后没有视频")
+            self.waveform_widget.clear("筛选后没有视频")
+            self.reference_info.setText("当前所选分组下没有视频。")
+            self.log("当前所选分组下没有可审核视频，请调整分组筛选。")
             return
 
         self.review_active = True
@@ -1876,19 +2129,10 @@ class ReviewWindow(QMainWindow):
         QTimer.singleShot(0, self.load_current_video)
 
     def reload_and_reset(self) -> None:
-        if self.items and not self.moved_after_finish:
-            reply = QMessageBox.question(
-                self,
-                "重新加载",
-                "重新加载会清空当前审核记录，是否继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
         self.next_video_prefetch_timer.stop()
         self.waveform_delay_timer.stop()
         self.pending_player_request_id += 1
+        self.group_filter_apply_timer.stop()
         self.player.stop()
         self.log("重新加载目录并重置审核记录。")
         self._load_videos()
