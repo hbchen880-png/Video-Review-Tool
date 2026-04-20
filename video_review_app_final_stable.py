@@ -549,6 +549,7 @@ class ReviewWindow(QMainWindow):
         self.available_review_groups: list[str] = []
         self.selected_review_groups: set[str] = set()
         self.applied_review_groups: set[str] = set()
+        self.group_selection_has_saved_state = False
         self.group_checkbox_map: dict[str, QCheckBox] = {}
         self.group_filter_updating = False
         self.logo_path: Optional[Path] = None
@@ -896,8 +897,13 @@ class ReviewWindow(QMainWindow):
             self.playback_speed = max(0.25, min(3.0, float(data.get("playback_speed", 1.0))))
         except (TypeError, ValueError):
             self.playback_speed = 1.0
-        saved_groups = data.get("selected_review_groups") or []
-        self.selected_review_groups = {str(x) for x in saved_groups if str(x).strip()}
+        if "selected_review_groups" in data:
+            self.group_selection_has_saved_state = True
+            saved_groups = data.get("selected_review_groups") or []
+            self.selected_review_groups = {str(x) for x in saved_groups if str(x).strip()}
+        else:
+            self.group_selection_has_saved_state = False
+            self.selected_review_groups = set()
 
         logo_value = data.get("logo_path")
         if logo_value:
@@ -1111,18 +1117,20 @@ class ReviewWindow(QMainWindow):
 
     def sync_review_group_selection(self, available_groups: list[str]) -> None:
         self.available_review_groups = self.natural_sort_strings(list(dict.fromkeys(available_groups)))
+        available_set = set(self.available_review_groups)
         if not self.available_review_groups:
             self.selected_review_groups = set()
             self.applied_review_groups = set()
             self.rebuild_group_filter_checkboxes()
             self.refresh_group_filter_display()
             return
-        if not self.selected_review_groups:
+
+        if not self.group_selection_has_saved_state:
             self.selected_review_groups = set(self.available_review_groups)
+            self.group_selection_has_saved_state = True
         else:
-            self.selected_review_groups &= set(self.available_review_groups)
-            if not self.selected_review_groups:
-                self.selected_review_groups = set(self.available_review_groups)
+            self.selected_review_groups &= available_set
+
         self.rebuild_group_filter_checkboxes()
         self.refresh_group_filter_display()
 
@@ -1186,6 +1194,7 @@ class ReviewWindow(QMainWindow):
             return
         if not self.available_review_groups:
             return
+        self.group_selection_has_saved_state = True
         self.group_filter_updating = True
         self.selected_review_groups = set(self.available_review_groups) if checked else set()
         for group, checkbox in self.group_checkbox_map.items():
@@ -1198,6 +1207,7 @@ class ReviewWindow(QMainWindow):
     def on_group_checkbox_toggled(self, checked: bool) -> None:
         if self.group_filter_updating:
             return
+        self.group_selection_has_saved_state = True
         self.selected_review_groups = {group for group, checkbox in self.group_checkbox_map.items() if checkbox.isChecked()}
         self.refresh_group_filter_display()
         self.schedule_group_filter_reload()
