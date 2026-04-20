@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QCheckBox,
+    QComboBox,
     QKeySequenceEdit,
     QLineEdit,
     QListWidget,
@@ -64,6 +65,17 @@ DEFAULT_SHORTCUTS = {
     "trim_out": "O",
     "cycle_reference": "Z",
 }
+
+
+PERSONALITY_PROFILE_IDS = ["profile_1", "profile_2", "profile_3"]
+
+
+def default_personality_profile_name(profile_id: str) -> str:
+    try:
+        index = PERSONALITY_PROFILE_IDS.index(profile_id) + 1
+    except ValueError:
+        index = 1
+    return f"个性设置{index}"
 
 
 def get_ffmpeg_exe() -> str:
@@ -257,29 +269,71 @@ class SettingsDialog(QDialog):
         self,
         parent: QWidget,
         base_dir: Path,
-        source_dir: Path,
-        pass_dir: Path,
-        fail_dir: Path,
-        product_library_dir: Path,
-        rename_to_finished_repo: bool,
-        shortcuts: dict[str, str],
+        personality_profiles: dict[str, dict],
+        active_profile_id: str,
         logo_path: Optional[Path],
     ) -> None:
         super().__init__(parent)
         self.base_dir = base_dir
         self.setWindowTitle("设置")
-        self.resize(900, 500)
+        self.resize(920, 560)
+        self.personality_profiles = self._normalize_profile_store(personality_profiles)
+        self.active_profile_id = active_profile_id if active_profile_id in PERSONALITY_PROFILE_IDS else PERSONALITY_PROFILE_IDS[0]
+        self.profile_switch_loading = False
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        self.profile_buttons: dict[str, QPushButton] = {}
+
+        profile_row = QHBoxLayout()
+        profile_row.setContentsMargins(0, 0, 0, 0)
+        profile_row.setSpacing(10)
+        profile_title = QLabel("个性设置")
+        profile_title.setStyleSheet("font-weight:700;")
+        profile_buttons_widget = QWidget()
+        profile_buttons_layout = QHBoxLayout(profile_buttons_widget)
+        profile_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        profile_buttons_layout.setSpacing(8)
+        for profile_id in PERSONALITY_PROFILE_IDS:
+            button = QPushButton(default_personality_profile_name(profile_id))
+            button.setCheckable(True)
+            button.setMinimumHeight(34)
+            button.setMinimumWidth(150)
+            button.clicked.connect(lambda _checked=False, pid=profile_id: self.on_profile_button_clicked(pid))
+            self.profile_buttons[profile_id] = button
+            profile_buttons_layout.addWidget(button)
+        profile_buttons_layout.addStretch(1)
+        profile_row.addWidget(profile_title)
+        profile_row.addWidget(profile_buttons_widget, 1)
+        root.addLayout(profile_row)
+
+        profile_name_row = QHBoxLayout()
+        profile_name_row.setContentsMargins(0, 0, 0, 0)
+        profile_name_row.setSpacing(8)
+        profile_name_label = QLabel("当前方案名称")
+        self.profile_name_edit = QLineEdit()
+        self.profile_name_edit.setPlaceholderText("给当前个性设置命名")
+        self.profile_name_edit.setMinimumWidth(260)
+        profile_name_row.addWidget(profile_name_label)
+        profile_name_row.addWidget(self.profile_name_edit, 1)
+        root.addLayout(profile_name_row)
+
+        profile_hint = QLabel("共 3 组。点击上方按钮即可切换方案；每组都可分别保存目录、快捷键和默认播放速度。")
+        profile_hint.setStyleSheet("color:#666;")
+        profile_hint.setWordWrap(True)
+        root.addWidget(profile_hint)
+
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         form.setHorizontalSpacing(16)
         form.setVerticalSpacing(12)
 
-        self.source_edit, source_row = self._build_path_row(str(source_dir))
-        self.pass_edit, pass_row = self._build_path_row(str(pass_dir))
-        self.fail_edit, fail_row = self._build_path_row(str(fail_dir))
-        self.product_library_edit, product_library_row = self._build_path_row(str(product_library_dir))
+        self.source_edit, source_row = self._build_path_row("")
+        self.pass_edit, pass_row = self._build_path_row("")
+        self.fail_edit, fail_row = self._build_path_row("")
+        self.product_library_edit, product_library_row = self._build_path_row("")
         self.logo_edit, logo_row = self._build_file_row(str(logo_path) if logo_path else "")
 
         form.addRow("源文件目录", source_row)
@@ -287,9 +341,14 @@ class SettingsDialog(QDialog):
         form.addRow("不通过目录", fail_row)
         form.addRow("产品库目录", product_library_row)
         self.rename_to_finished_repo_check = QCheckBox("启用")
-        self.rename_to_finished_repo_check.setChecked(rename_to_finished_repo)
         self.rename_to_finished_repo_check.setToolTip("开启后，审核通过的视频会按根目录下“文案库”的文案重命名，并放入根目录下“成品仓库”的对应文件夹。")
         form.addRow("是否重命名后放入成品仓库", self.rename_to_finished_repo_check)
+        self.default_playback_speed_spin = QDoubleSpinBox()
+        self.default_playback_speed_spin.setRange(0.25, 3.0)
+        self.default_playback_speed_spin.setSingleStep(0.05)
+        self.default_playback_speed_spin.setDecimals(2)
+        self.default_playback_speed_spin.setSuffix(" x")
+        form.addRow("默认播放速度", self.default_playback_speed_spin)
         form.addRow("Logo 图片", logo_row)
 
         shortcut_widget = QWidget()
@@ -298,14 +357,14 @@ class SettingsDialog(QDialog):
         shortcut_layout.setHorizontalSpacing(18)
         shortcut_layout.setVerticalSpacing(10)
 
-        self.pass_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("pass", DEFAULT_SHORTCUTS["pass"])))
-        self.fail_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("fail", DEFAULT_SHORTCUTS["fail"])))
-        self.previous_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("previous", DEFAULT_SHORTCUTS["previous"])))
-        self.end_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("end", DEFAULT_SHORTCUTS["end"])))
-        self.pause_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("pause", DEFAULT_SHORTCUTS["pause"])))
-        self.trim_in_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("trim_in", DEFAULT_SHORTCUTS["trim_in"])))
-        self.trim_out_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("trim_out", DEFAULT_SHORTCUTS["trim_out"])))
-        self.cycle_reference_key_edit = QKeySequenceEdit(QKeySequence(shortcuts.get("cycle_reference", DEFAULT_SHORTCUTS["cycle_reference"])))
+        self.pass_key_edit = QKeySequenceEdit()
+        self.fail_key_edit = QKeySequenceEdit()
+        self.previous_key_edit = QKeySequenceEdit()
+        self.end_key_edit = QKeySequenceEdit()
+        self.pause_key_edit = QKeySequenceEdit()
+        self.trim_in_key_edit = QKeySequenceEdit()
+        self.trim_out_key_edit = QKeySequenceEdit()
+        self.cycle_reference_key_edit = QKeySequenceEdit()
 
         shortcut_layout.addWidget(QLabel("通过"), 0, 0)
         shortcut_layout.addWidget(self.pass_key_edit, 0, 1)
@@ -327,7 +386,7 @@ class SettingsDialog(QDialog):
         form.addRow("快捷键", shortcut_widget)
         root.addLayout(form)
 
-        tip = QLabel("I：设置裁剪起点；O：把 I 到 O 的区间直接裁剪到通过目录。若未设置 I，则默认从 0 秒裁到 O。Z：切换当前产品参考图，切换后会记住。拖动时间条时会自动暂停并显示该帧。开启“重命名后放入成品仓库”后，会读取程序根目录下“文案库”的对应文案，一行文案对应一个成品文件名；若名字已在“成品仓库”对应文件夹中被占用，则自动跳过该文案，不会加后缀。")
+        tip = QLabel("个性设置会保存：源文件目录、通过目录、不通过目录、产品库目录、是否重命名后放入成品仓库、全部快捷键、默认播放速度。首页也可以快速切换个性设置。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #666;")
         root.addWidget(tip)
@@ -344,6 +403,184 @@ class SettingsDialog(QDialog):
         btn_row.addWidget(self.cancel_button)
         btn_row.addWidget(self.save_button)
         root.addLayout(btn_row)
+
+        self.profile_name_edit.textChanged.connect(self.on_profile_name_changed)
+        self.refresh_profile_buttons()
+        self.set_active_profile(self.active_profile_id)
+
+    @staticmethod
+    def default_profile_settings(base_dir: Path) -> dict:
+        return {
+            "source_dir": str(base_dir / SOURCE_DIR_NAME),
+            "pass_dir": str(base_dir / PASS_DIR_NAME),
+            "fail_dir": str(base_dir / FAIL_DIR_NAME),
+            "product_library_dir": str(base_dir / PRODUCT_LIBRARY_DIR_NAME),
+            "rename_to_finished_repo": False,
+            "playback_speed": 1.0,
+            "shortcuts": DEFAULT_SHORTCUTS.copy(),
+        }
+
+    def _normalize_profile_store(self, profile_store: dict[str, dict]) -> dict[str, dict]:
+        result: dict[str, dict] = {}
+        default_settings = self.default_profile_settings(self.base_dir)
+        profile_store = profile_store or {}
+        for profile_id in PERSONALITY_PROFILE_IDS:
+            raw_entry = profile_store.get(profile_id) if isinstance(profile_store, dict) else None
+            name = default_personality_profile_name(profile_id)
+            raw_settings = None
+            if isinstance(raw_entry, dict):
+                raw_name = str(raw_entry.get("name", "")).strip()
+                if raw_name:
+                    name = raw_name
+                raw_settings = raw_entry.get("settings") if isinstance(raw_entry.get("settings"), dict) else raw_entry
+            result[profile_id] = {
+                "name": name,
+                "settings": self._normalize_settings(raw_settings, default_settings),
+            }
+        return result
+
+    @staticmethod
+    def _normalize_settings(raw_settings: Optional[dict], fallback: dict) -> dict:
+        fallback = {
+            **fallback,
+            "shortcuts": dict(fallback.get("shortcuts") or DEFAULT_SHORTCUTS),
+        }
+        raw_settings = raw_settings or {}
+        try:
+            playback_speed = max(0.25, min(3.0, float(raw_settings.get("playback_speed", fallback["playback_speed"]))))
+        except (TypeError, ValueError):
+            playback_speed = float(fallback["playback_speed"])
+        shortcuts = dict(fallback.get("shortcuts") or DEFAULT_SHORTCUTS)
+        raw_shortcuts = raw_settings.get("shortcuts") if isinstance(raw_settings.get("shortcuts"), dict) else {}
+        for key, default_value in DEFAULT_SHORTCUTS.items():
+            value = raw_shortcuts.get(key)
+            shortcuts[key] = str(value).strip() if value else shortcuts.get(key, default_value)
+            if not shortcuts[key]:
+                shortcuts[key] = default_value
+        return {
+            "source_dir": str(raw_settings.get("source_dir") or fallback["source_dir"]),
+            "pass_dir": str(raw_settings.get("pass_dir") or fallback["pass_dir"]),
+            "fail_dir": str(raw_settings.get("fail_dir") or fallback["fail_dir"]),
+            "product_library_dir": str(raw_settings.get("product_library_dir") or fallback["product_library_dir"]),
+            "rename_to_finished_repo": bool(raw_settings.get("rename_to_finished_repo", fallback["rename_to_finished_repo"])),
+            "playback_speed": playback_speed,
+            "shortcuts": shortcuts,
+        }
+
+    @staticmethod
+    def profile_button_style(selected: bool) -> str:
+        if selected:
+            return (
+                "QPushButton {background:#eaf3ff; border:1px solid #4a90e2; border-radius:8px;"
+                "padding:6px 14px; font-weight:700; color:#1f4f8f;}"
+            )
+        return (
+            "QPushButton {background:#f7f7f7; border:1px solid #d9d9d9; border-radius:8px;"
+            "padding:6px 14px; color:#444;}"
+            "QPushButton:hover {border-color:#4a90e2;}"
+        )
+
+    def refresh_profile_buttons(self) -> None:
+        current_id = self.current_profile_id()
+        for profile_id in PERSONALITY_PROFILE_IDS:
+            entry = self.personality_profiles.get(profile_id) or {}
+            name = str(entry.get("name") or default_personality_profile_name(profile_id))
+            button = self.profile_buttons.get(profile_id)
+            if button is None:
+                continue
+            button.blockSignals(True)
+            button.setText(name)
+            button.setChecked(profile_id == current_id)
+            button.setStyleSheet(self.profile_button_style(profile_id == current_id))
+            button.blockSignals(False)
+
+    def current_profile_id(self) -> str:
+        return self.active_profile_id if self.active_profile_id in PERSONALITY_PROFILE_IDS else PERSONALITY_PROFILE_IDS[0]
+
+    def set_active_profile(self, profile_id: str) -> None:
+        if profile_id not in PERSONALITY_PROFILE_IDS:
+            profile_id = PERSONALITY_PROFILE_IDS[0]
+        self.profile_switch_loading = True
+        self.active_profile_id = profile_id
+        self.refresh_profile_buttons()
+        self.load_profile_into_form(profile_id)
+        self.profile_switch_loading = False
+
+    def load_profile_into_form(self, profile_id: str) -> None:
+        entry = self.personality_profiles.get(profile_id) or {}
+        settings = entry.get("settings") or self.default_profile_settings(self.base_dir)
+        self.profile_name_edit.blockSignals(True)
+        self.profile_name_edit.setText(str(entry.get("name") or default_personality_profile_name(profile_id)))
+        self.profile_name_edit.blockSignals(False)
+        self.source_edit.setText(settings["source_dir"])
+        self.pass_edit.setText(settings["pass_dir"])
+        self.fail_edit.setText(settings["fail_dir"])
+        self.product_library_edit.setText(settings["product_library_dir"])
+        self.rename_to_finished_repo_check.setChecked(bool(settings["rename_to_finished_repo"]))
+        self.default_playback_speed_spin.setValue(float(settings["playback_speed"]))
+        shortcuts = settings.get("shortcuts") or DEFAULT_SHORTCUTS
+        self.pass_key_edit.setKeySequence(QKeySequence(shortcuts.get("pass", DEFAULT_SHORTCUTS["pass"])))
+        self.fail_key_edit.setKeySequence(QKeySequence(shortcuts.get("fail", DEFAULT_SHORTCUTS["fail"])))
+        self.previous_key_edit.setKeySequence(QKeySequence(shortcuts.get("previous", DEFAULT_SHORTCUTS["previous"])))
+        self.end_key_edit.setKeySequence(QKeySequence(shortcuts.get("end", DEFAULT_SHORTCUTS["end"])))
+        self.pause_key_edit.setKeySequence(QKeySequence(shortcuts.get("pause", DEFAULT_SHORTCUTS["pause"])))
+        self.trim_in_key_edit.setKeySequence(QKeySequence(shortcuts.get("trim_in", DEFAULT_SHORTCUTS["trim_in"])))
+        self.trim_out_key_edit.setKeySequence(QKeySequence(shortcuts.get("trim_out", DEFAULT_SHORTCUTS["trim_out"])))
+        self.cycle_reference_key_edit.setKeySequence(QKeySequence(shortcuts.get("cycle_reference", DEFAULT_SHORTCUTS["cycle_reference"])))
+
+    def sync_form_to_profile(self, profile_id: Optional[str] = None) -> None:
+        profile_id = profile_id or self.current_profile_id()
+        if profile_id not in PERSONALITY_PROFILE_IDS:
+            return
+        entry = self.personality_profiles.setdefault(profile_id, {
+            "name": default_personality_profile_name(profile_id),
+            "settings": self.default_profile_settings(self.base_dir),
+        })
+        name = self.profile_name_edit.text().strip() or default_personality_profile_name(profile_id)
+        entry["name"] = name
+        entry["settings"] = self._normalize_settings({
+            "source_dir": self.source_edit.text().strip(),
+            "pass_dir": self.pass_edit.text().strip(),
+            "fail_dir": self.fail_edit.text().strip(),
+            "product_library_dir": self.product_library_edit.text().strip(),
+            "rename_to_finished_repo": self.rename_to_finished_repo_check.isChecked(),
+            "playback_speed": self.default_playback_speed_spin.value(),
+            "shortcuts": {
+                "pass": self.pass_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
+                "fail": self.fail_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
+                "previous": self.previous_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
+                "end": self.end_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
+                "pause": self.pause_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
+                "trim_in": self.trim_in_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
+                "trim_out": self.trim_out_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
+                "cycle_reference": self.cycle_reference_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
+            },
+        }, self.default_profile_settings(self.base_dir))
+
+    def on_profile_button_clicked(self, profile_id: str) -> None:
+        if self.profile_switch_loading:
+            return
+        if profile_id not in PERSONALITY_PROFILE_IDS:
+            return
+        previous_profile_id = self.active_profile_id
+        if previous_profile_id in PERSONALITY_PROFILE_IDS:
+            self.sync_form_to_profile(previous_profile_id)
+        self.active_profile_id = profile_id
+        self.profile_switch_loading = True
+        self.refresh_profile_buttons()
+        self.load_profile_into_form(profile_id)
+        self.profile_switch_loading = False
+
+    def on_profile_name_changed(self, text: str) -> None:
+        profile_id = self.current_profile_id()
+        if profile_id not in PERSONALITY_PROFILE_IDS:
+            return
+        entry = self.personality_profiles.setdefault(profile_id, {
+            "name": default_personality_profile_name(profile_id),
+            "settings": self.default_profile_settings(self.base_dir),
+        })
+        entry["name"] = text.strip() or default_personality_profile_name(profile_id)
+        self.refresh_profile_buttons()
 
     def _build_path_row(self, value: str) -> tuple[QLineEdit, QWidget]:
         row_widget = QWidget()
@@ -387,12 +624,14 @@ class SettingsDialog(QDialog):
             target_edit.setText(selected)
 
     def reset_defaults(self) -> None:
-        self.source_edit.setText(str(self.base_dir / SOURCE_DIR_NAME))
-        self.pass_edit.setText(str(self.base_dir / PASS_DIR_NAME))
-        self.fail_edit.setText(str(self.base_dir / FAIL_DIR_NAME))
-        self.product_library_edit.setText(str(self.base_dir / PRODUCT_LIBRARY_DIR_NAME))
+        current_name = self.profile_name_edit.text().strip() or default_personality_profile_name(self.current_profile_id())
+        default_settings = self.default_profile_settings(self.base_dir)
+        self.source_edit.setText(default_settings["source_dir"])
+        self.pass_edit.setText(default_settings["pass_dir"])
+        self.fail_edit.setText(default_settings["fail_dir"])
+        self.product_library_edit.setText(default_settings["product_library_dir"])
         self.rename_to_finished_repo_check.setChecked(False)
-        self.logo_edit.setText(str(self.base_dir / LOGO_FILE_NAME))
+        self.default_playback_speed_spin.setValue(float(default_settings["playback_speed"]))
         self.pass_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["pass"]))
         self.fail_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["fail"]))
         self.previous_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["previous"]))
@@ -401,34 +640,25 @@ class SettingsDialog(QDialog):
         self.trim_in_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["trim_in"]))
         self.trim_out_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["trim_out"]))
         self.cycle_reference_key_edit.setKeySequence(QKeySequence(DEFAULT_SHORTCUTS["cycle_reference"]))
+        self.profile_name_edit.setText(current_name)
 
     def get_values(self) -> dict:
+        self.sync_form_to_profile(self.current_profile_id())
         return {
-            "source_dir": self.source_edit.text().strip(),
-            "pass_dir": self.pass_edit.text().strip(),
-            "fail_dir": self.fail_edit.text().strip(),
-            "product_library_dir": self.product_library_edit.text().strip(),
-            "rename_to_finished_repo": self.rename_to_finished_repo_check.isChecked(),
+            "active_profile_id": self.current_profile_id(),
+            "personality_profiles": self.personality_profiles,
             "logo_path": self.logo_edit.text().strip(),
-            "shortcuts": {
-                "pass": self.pass_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
-                "fail": self.fail_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
-                "previous": self.previous_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
-                "end": self.end_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
-                "pause": self.pause_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
-                "trim_in": self.trim_in_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
-                "trim_out": self.trim_out_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
-                "cycle_reference": self.cycle_reference_key_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText),
-            },
+            "current_profile_settings": self.personality_profiles[self.current_profile_id()]["settings"],
         }
 
     def validate_and_accept(self) -> None:
         values = self.get_values()
-        if any(not values[key] for key in ("source_dir", "pass_dir", "fail_dir", "product_library_dir")):
+        current_settings = values["current_profile_settings"]
+        if any(not current_settings[key] for key in ("source_dir", "pass_dir", "fail_dir", "product_library_dir")):
             QMessageBox.warning(self, "设置无效", "源文件目录、通过目录、不通过目录、产品库目录都不能为空。")
             return
 
-        shortcut_values = values["shortcuts"]
+        shortcut_values = current_settings["shortcuts"]
         if any(not value for value in shortcut_values.values()):
             QMessageBox.warning(self, "设置无效", "所有快捷键都必须设置。")
             return
@@ -456,6 +686,7 @@ class SettingsDialog(QDialog):
             seen[normalized] = key
 
         self.accept()
+
 
 
 class FlowLayout(QLayout):
@@ -555,6 +786,9 @@ class ReviewWindow(QMainWindow):
         self.group_filter_updating = False
         self.logo_path: Optional[Path] = None
         self.shortcuts_map = DEFAULT_SHORTCUTS.copy()
+        self.personality_profiles: dict[str, dict] = {}
+        self.active_personality_profile = PERSONALITY_PROFILE_IDS[0]
+        self.personality_profile_widget_updating = False
         self.reference_selection_map: dict[str, str] = {}
         self.reference_library_images: list[Path] = []
         self.reference_library_records: list[tuple[Path, str, str, str, str]] = []
@@ -660,6 +894,7 @@ class ReviewWindow(QMainWindow):
         top_bar.addWidget(self.btn_open_dir)
         top_bar.addWidget(self.logo_preview)
         top_bar.addLayout(title_box, 1)
+
         self._update_logo_preview()
         page.addLayout(top_bar)
 
@@ -705,8 +940,33 @@ class ReviewWindow(QMainWindow):
         left_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         center_panel = QVBoxLayout()
+        center_header = QHBoxLayout()
+        center_header.setContentsMargins(0, 0, 0, 0)
+        center_header.setSpacing(8)
         self.video_title = QLabel("当前视频：")
         self.video_title.setStyleSheet("font-size:18px; font-weight:700;")
+        center_header.addWidget(self.video_title, 1)
+
+        self.personality_profile_label = QLabel("个性设置")
+        self.personality_profile_label.setStyleSheet("color:#444; font-weight:600;")
+        self.personality_profile_buttons: dict[str, QPushButton] = {}
+        personality_switch_widget = QWidget()
+        personality_switch_layout = QHBoxLayout(personality_switch_widget)
+        personality_switch_layout.setContentsMargins(0, 0, 0, 0)
+        personality_switch_layout.setSpacing(6)
+        personality_switch_layout.addWidget(self.personality_profile_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        for profile_id in PERSONALITY_PROFILE_IDS:
+            button = QPushButton(default_personality_profile_name(profile_id))
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumHeight(30)
+            button.setMinimumWidth(86)
+            button.clicked.connect(lambda _checked=False, pid=profile_id: self.on_home_personality_profile_button_clicked(pid))
+            self.personality_profile_buttons[profile_id] = button
+            personality_switch_layout.addWidget(button)
+        center_header.addWidget(personality_switch_widget, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
         self.video_widget = QVideoWidget()
         self.video_widget.setStyleSheet("background:#111;")
         self.video_widget.setMinimumSize(320, 200)
@@ -787,7 +1047,7 @@ class ReviewWindow(QMainWindow):
         timeline_grid.addWidget(speed_box, 1, 1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
         timeline_grid.setColumnStretch(0, 1)
 
-        center_panel.addWidget(self.video_title)
+        center_panel.addLayout(center_header)
         center_panel.addWidget(self.video_widget, 1)
         center_panel.addLayout(timeline_grid)
         center_panel.addWidget(self.current_status)
@@ -886,8 +1146,157 @@ class ReviewWindow(QMainWindow):
             shortcut.setKey(QKeySequence(self.shortcuts_map[key]))
         self.refresh_shortcut_texts()
 
+    def default_profile_settings(self) -> dict:
+        return {
+            "source_dir": str(self.base_dir / SOURCE_DIR_NAME),
+            "pass_dir": str(self.base_dir / PASS_DIR_NAME),
+            "fail_dir": str(self.base_dir / FAIL_DIR_NAME),
+            "product_library_dir": str(self.base_dir / PRODUCT_LIBRARY_DIR_NAME),
+            "rename_to_finished_repo": False,
+            "playback_speed": 1.0,
+            "shortcuts": DEFAULT_SHORTCUTS.copy(),
+        }
+
+    def normalize_profile_settings(self, raw_settings: Optional[dict], fallback: Optional[dict] = None) -> dict:
+        fallback = {
+            **(fallback or self.default_profile_settings()),
+            "shortcuts": dict((fallback or self.default_profile_settings()).get("shortcuts") or DEFAULT_SHORTCUTS),
+        }
+        raw_settings = raw_settings or {}
+        try:
+            playback_speed = max(0.25, min(3.0, float(raw_settings.get("playback_speed", fallback["playback_speed"]))))
+        except (TypeError, ValueError):
+            playback_speed = float(fallback["playback_speed"])
+        shortcuts = dict(fallback.get("shortcuts") or DEFAULT_SHORTCUTS)
+        raw_shortcuts = raw_settings.get("shortcuts") if isinstance(raw_settings.get("shortcuts"), dict) else {}
+        for key, default_value in DEFAULT_SHORTCUTS.items():
+            value = raw_shortcuts.get(key)
+            shortcuts[key] = str(value).strip() if value else shortcuts.get(key, default_value)
+            if not shortcuts[key]:
+                shortcuts[key] = default_value
+        return {
+            "source_dir": str(raw_settings.get("source_dir") or fallback["source_dir"]),
+            "pass_dir": str(raw_settings.get("pass_dir") or fallback["pass_dir"]),
+            "fail_dir": str(raw_settings.get("fail_dir") or fallback["fail_dir"]),
+            "product_library_dir": str(raw_settings.get("product_library_dir") or fallback["product_library_dir"]),
+            "rename_to_finished_repo": bool(raw_settings.get("rename_to_finished_repo", fallback["rename_to_finished_repo"])),
+            "playback_speed": playback_speed,
+            "shortcuts": shortcuts,
+        }
+
+    def build_runtime_profile_settings(self) -> dict:
+        return {
+            "source_dir": str(self.source_dir),
+            "pass_dir": str(self.pass_dir),
+            "fail_dir": str(self.fail_dir),
+            "product_library_dir": str(self.product_library_dir),
+            "rename_to_finished_repo": self.rename_to_finished_repo,
+            "playback_speed": self.playback_speed,
+            "shortcuts": dict(self.shortcuts_map),
+        }
+
+    def normalize_personality_profiles(self, raw_profiles: Optional[dict], fallback_settings: Optional[dict] = None) -> dict[str, dict]:
+        fallback_settings = self.normalize_profile_settings(fallback_settings or self.default_profile_settings())
+        raw_profiles = raw_profiles or {}
+        profiles: dict[str, dict] = {}
+        for profile_id in PERSONALITY_PROFILE_IDS:
+            raw_entry = raw_profiles.get(profile_id) if isinstance(raw_profiles, dict) else None
+            name = default_personality_profile_name(profile_id)
+            raw_settings = None
+            if isinstance(raw_entry, dict):
+                raw_name = str(raw_entry.get("name", "")).strip()
+                if raw_name:
+                    name = raw_name
+                raw_settings = raw_entry.get("settings") if isinstance(raw_entry.get("settings"), dict) else raw_entry
+            profiles[profile_id] = {
+                "name": name,
+                "settings": self.normalize_profile_settings(raw_settings, fallback_settings),
+            }
+        return profiles
+
+    def sync_runtime_into_active_profile(self) -> None:
+        profile_id = self.active_personality_profile
+        if profile_id not in PERSONALITY_PROFILE_IDS:
+            return
+        if not self.personality_profiles:
+            self.personality_profiles = self.normalize_personality_profiles(None, self.build_runtime_profile_settings())
+        entry = self.personality_profiles.setdefault(profile_id, {
+            "name": default_personality_profile_name(profile_id),
+            "settings": self.default_profile_settings(),
+        })
+        entry["name"] = str(entry.get("name") or default_personality_profile_name(profile_id))
+        entry["settings"] = self.normalize_profile_settings(self.build_runtime_profile_settings(), self.default_profile_settings())
+
+    def activate_personality_profile(
+        self,
+        profile_id: str,
+        *,
+        sync_current_before_switch: bool = True,
+        persist: bool = True,
+        force_apply: bool = False,
+        show_message: bool = True,
+        request_label: str = "",
+    ) -> None:
+        if profile_id not in PERSONALITY_PROFILE_IDS:
+            return
+        if sync_current_before_switch:
+            self.sync_runtime_into_active_profile()
+        previous_source_dir = self.source_dir
+        previous_product_library_dir = self.product_library_dir
+        previous_profile_id = self.active_personality_profile
+        self.active_personality_profile = profile_id
+        entry = self.personality_profiles.get(profile_id) or {
+            "name": default_personality_profile_name(profile_id),
+            "settings": self.default_profile_settings(),
+        }
+        settings = self.normalize_profile_settings(entry.get("settings"), self.default_profile_settings())
+        self.personality_profiles[profile_id] = {
+            "name": str(entry.get("name") or default_personality_profile_name(profile_id)),
+            "settings": settings,
+        }
+        self.source_dir = Path(settings["source_dir"])
+        self.pass_dir = Path(settings["pass_dir"])
+        self.fail_dir = Path(settings["fail_dir"])
+        self.product_library_dir = Path(settings["product_library_dir"])
+        self.rename_to_finished_repo = bool(settings["rename_to_finished_repo"])
+        self.playback_speed = float(settings["playback_speed"])
+        self.shortcuts_map = dict(settings["shortcuts"])
+        if hasattr(self, "player") and self.player is not None:
+            self.player.setPlaybackRate(self.playback_speed)
+        if hasattr(self, "personality_profile_buttons"):
+            self.refresh_personality_profile_widgets()
+        if hasattr(self, "shortcut_objects"):
+            self._bind_shortcuts()
+        if hasattr(self, "reference_dir_label"):
+            self.refresh_settings_display()
+        need_reload = force_apply or previous_source_dir != self.source_dir or previous_product_library_dir != self.product_library_dir
+        if need_reload and hasattr(self, "queue_list"):
+            self.reload_and_reset()
+        elif hasattr(self, "queue_list"):
+            self.refresh_reference_library_index()
+            if 0 <= self.current_index < len(self.items):
+                self.update_reference_preview_for_item(self.items[self.current_index])
+        if persist:
+            self.save_config()
+        if show_message and hasattr(self, "statusBar"):
+            profile_name = self.personality_profiles[profile_id]["name"]
+            prefix = f"{request_label}：" if request_label else ""
+            self.statusBar().showMessage(f"{prefix}已切换到个性设置“{profile_name}”。", 3000)
+            if request_label:
+                self.log(f"{request_label}：已切换到个性设置“{profile_name}”。")
+
     def _load_config(self) -> None:
         if not self.config_path.exists():
+            self.personality_profiles = self.normalize_personality_profiles(None, self.default_profile_settings())
+            self.active_personality_profile = PERSONALITY_PROFILE_IDS[0]
+            settings = self.personality_profiles[self.active_personality_profile]["settings"]
+            self.source_dir = Path(settings["source_dir"])
+            self.pass_dir = Path(settings["pass_dir"])
+            self.fail_dir = Path(settings["fail_dir"])
+            self.product_library_dir = Path(settings["product_library_dir"])
+            self.rename_to_finished_repo = bool(settings["rename_to_finished_repo"])
+            self.playback_speed = float(settings["playback_speed"])
+            self.shortcuts_map = dict(settings["shortcuts"])
             default_logo = self.base_dir / LOGO_FILE_NAME
             self.logo_path = default_logo if default_logo.exists() else None
             return
@@ -896,15 +1305,31 @@ class ReviewWindow(QMainWindow):
         except Exception:
             return
 
-        self.source_dir = self.resolve_config_path(data.get("source_dir"), self.base_dir / SOURCE_DIR_NAME)
-        self.pass_dir = self.resolve_config_path(data.get("pass_dir"), self.base_dir / PASS_DIR_NAME)
-        self.fail_dir = self.resolve_config_path(data.get("fail_dir"), self.base_dir / FAIL_DIR_NAME)
-        self.product_library_dir = self.resolve_config_path(data.get("product_library_dir"), self.base_dir / PRODUCT_LIBRARY_DIR_NAME)
-        self.rename_to_finished_repo = bool(data.get("rename_to_finished_repo", False))
-        try:
-            self.playback_speed = max(0.25, min(3.0, float(data.get("playback_speed", 1.0))))
-        except (TypeError, ValueError):
-            self.playback_speed = 1.0
+        legacy_settings = self.default_profile_settings()
+        legacy_settings = self.normalize_profile_settings({
+            "source_dir": str(self.resolve_config_path(data.get("source_dir"), self.base_dir / SOURCE_DIR_NAME)),
+            "pass_dir": str(self.resolve_config_path(data.get("pass_dir"), self.base_dir / PASS_DIR_NAME)),
+            "fail_dir": str(self.resolve_config_path(data.get("fail_dir"), self.base_dir / FAIL_DIR_NAME)),
+            "product_library_dir": str(self.resolve_config_path(data.get("product_library_dir"), self.base_dir / PRODUCT_LIBRARY_DIR_NAME)),
+            "rename_to_finished_repo": bool(data.get("rename_to_finished_repo", False)),
+            "playback_speed": data.get("playback_speed", 1.0),
+            "shortcuts": data.get("shortcuts") or {},
+        }, legacy_settings)
+
+        self.personality_profiles = self.normalize_personality_profiles(data.get("personality_profiles"), legacy_settings)
+        active_profile_id = str(data.get("active_personality_profile") or PERSONALITY_PROFILE_IDS[0])
+        if active_profile_id not in PERSONALITY_PROFILE_IDS:
+            active_profile_id = PERSONALITY_PROFILE_IDS[0]
+        self.active_personality_profile = active_profile_id
+        active_settings = self.personality_profiles[self.active_personality_profile]["settings"]
+        self.source_dir = Path(active_settings["source_dir"])
+        self.pass_dir = Path(active_settings["pass_dir"])
+        self.fail_dir = Path(active_settings["fail_dir"])
+        self.product_library_dir = Path(active_settings["product_library_dir"])
+        self.rename_to_finished_repo = bool(active_settings["rename_to_finished_repo"])
+        self.playback_speed = float(active_settings["playback_speed"])
+        self.shortcuts_map = dict(active_settings["shortcuts"])
+
         if "selected_review_groups" in data:
             self.group_selection_has_saved_state = True
             saved_groups = data.get("selected_review_groups") or []
@@ -922,14 +1347,6 @@ class ReviewWindow(QMainWindow):
 
         selection_map = data.get("reference_selection_map") or {}
         self.reference_selection_map = {str(k): str(v) for k, v in selection_map.items() if k and v}
-
-        shortcuts = data.get("shortcuts") or {}
-        for key, default_value in DEFAULT_SHORTCUTS.items():
-            value = shortcuts.get(key)
-            if value:
-                self.shortcuts_map[key] = value
-            else:
-                self.shortcuts_map[key] = default_value
 
     @staticmethod
     def resolve_config_path(value: Optional[str], default: Path) -> Path:
@@ -1026,17 +1443,32 @@ class ReviewWindow(QMainWindow):
         return raw.decode("utf-8", errors="ignore")
 
     def save_config(self) -> None:
+        self.sync_runtime_into_active_profile()
+        active_entry = self.personality_profiles.get(self.active_personality_profile) or {
+            "name": default_personality_profile_name(self.active_personality_profile),
+            "settings": self.build_runtime_profile_settings(),
+        }
+        active_settings = self.normalize_profile_settings(active_entry.get("settings"), self.default_profile_settings())
+        serialized_profiles = {}
+        for profile_id in PERSONALITY_PROFILE_IDS:
+            entry = self.personality_profiles.get(profile_id) or {}
+            serialized_profiles[profile_id] = {
+                "name": str(entry.get("name") or default_personality_profile_name(profile_id)),
+                "settings": self.normalize_profile_settings(entry.get("settings"), active_settings if profile_id == self.active_personality_profile else self.default_profile_settings()),
+            }
         data = {
-            "source_dir": str(self.source_dir),
-            "pass_dir": str(self.pass_dir),
-            "fail_dir": str(self.fail_dir),
-            "product_library_dir": str(self.product_library_dir),
-            "rename_to_finished_repo": self.rename_to_finished_repo,
-            "playback_speed": self.playback_speed,
+            "source_dir": active_settings["source_dir"],
+            "pass_dir": active_settings["pass_dir"],
+            "fail_dir": active_settings["fail_dir"],
+            "product_library_dir": active_settings["product_library_dir"],
+            "rename_to_finished_repo": active_settings["rename_to_finished_repo"],
+            "playback_speed": active_settings["playback_speed"],
+            "shortcuts": active_settings["shortcuts"],
+            "active_personality_profile": self.active_personality_profile,
+            "personality_profiles": serialized_profiles,
             "selected_review_groups": sorted(self.selected_review_groups),
             "logo_path": str(self.logo_path) if self.logo_path else "",
             "reference_selection_map": self.reference_selection_map,
-            "shortcuts": self.shortcuts_map,
         }
         self.config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1081,6 +1513,33 @@ class ReviewWindow(QMainWindow):
             f"按 {native('cycle_reference')} 可切换当前产品参考图；切换后会自动记住，后续同产品视频默认使用这张图。"
         )
 
+    @staticmethod
+    def personality_profile_button_style(selected: bool) -> str:
+        if selected:
+            return (
+                "QPushButton {"
+                "padding:4px 14px; font-weight:600;}"
+            )
+        return "QPushButton {padding:4px 14px;}"
+
+    def refresh_personality_profile_widgets(self) -> None:
+        if not hasattr(self, "personality_profile_buttons"):
+            return
+        self.personality_profile_widget_updating = True
+        current_profile_id = self.active_personality_profile if self.active_personality_profile in PERSONALITY_PROFILE_IDS else PERSONALITY_PROFILE_IDS[0]
+        for profile_id in PERSONALITY_PROFILE_IDS:
+            entry = self.personality_profiles.get(profile_id) or {}
+            name = str(entry.get("name") or default_personality_profile_name(profile_id))
+            button = self.personality_profile_buttons.get(profile_id)
+            if button is None:
+                continue
+            button.blockSignals(True)
+            button.setText(name)
+            button.setChecked(profile_id == current_profile_id)
+            button.setStyleSheet(self.personality_profile_button_style(profile_id == current_profile_id))
+            button.blockSignals(False)
+        self.personality_profile_widget_updating = False
+
     def refresh_settings_display(self) -> None:
         self.reference_dir_label.setText(
             f"产品库目录：{self.product_library_dir}\n"
@@ -1088,12 +1547,20 @@ class ReviewWindow(QMainWindow):
             f"通过目录：{self.pass_dir}｜不通过目录：{self.fail_dir}"
         )
         self.refresh_shortcut_texts()
+        self.refresh_personality_profile_widgets()
         if hasattr(self, "playback_speed_spin"):
             self.playback_speed_spin.blockSignals(True)
             self.playback_speed_spin.setValue(self.playback_speed)
             self.playback_speed_spin.blockSignals(False)
         self.refresh_group_filter_display()
         self._update_logo_preview()
+
+    def on_home_personality_profile_button_clicked(self, profile_id: str) -> None:
+        if self.personality_profile_widget_updating:
+            return
+        if profile_id not in PERSONALITY_PROFILE_IDS:
+            return
+        self.activate_personality_profile(profile_id, request_label="首页快捷切换")
 
     @Slot(float)
     def on_playback_speed_changed(self, value: float) -> None:
@@ -1105,6 +1572,7 @@ class ReviewWindow(QMainWindow):
             self.playback_speed_spin.blockSignals(False)
         if hasattr(self, "player") and self.player is not None:
             self.player.setPlaybackRate(normalized)
+        self.sync_runtime_into_active_profile()
         self.save_config()
         self.statusBar().showMessage(f"播放速度已设置为 {normalized:.2f}x，后续视频将按此速度播放。", 2500)
 
@@ -2539,39 +3007,29 @@ class ReviewWindow(QMainWindow):
         dialog = SettingsDialog(
             self,
             self.base_dir,
-            self.source_dir,
-            self.pass_dir,
-            self.fail_dir,
-            self.product_library_dir,
-            self.rename_to_finished_repo,
-            self.shortcuts_map,
+            self.personality_profiles,
+            self.active_personality_profile,
             self.logo_path,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         values = dialog.get_values()
-        old_source_dir = self.source_dir
-        old_product_library_dir = self.product_library_dir
-        self.source_dir = Path(values["source_dir"])
-        self.pass_dir = Path(values["pass_dir"])
-        self.fail_dir = Path(values["fail_dir"])
-        self.product_library_dir = Path(values["product_library_dir"])
-        self.rename_to_finished_repo = bool(values["rename_to_finished_repo"])
+        self.personality_profiles = values["personality_profiles"]
+        self.active_personality_profile = values["active_profile_id"] if values["active_profile_id"] in PERSONALITY_PROFILE_IDS else PERSONALITY_PROFILE_IDS[0]
         logo_value = values["logo_path"].strip()
         self.logo_path = Path(logo_value) if logo_value else None
-        self.shortcuts_map = values["shortcuts"]
-        self.save_config()
         self._apply_logo()
-        self._bind_shortcuts()
+        self.activate_personality_profile(
+            self.active_personality_profile,
+            sync_current_before_switch=False,
+            persist=False,
+            force_apply=True,
+            show_message=False,
+        )
+        self.save_config()
         self.refresh_settings_display()
-        self.log("设置已保存。")
-        if self.source_dir != old_source_dir or self.product_library_dir != old_product_library_dir:
-            self.reload_and_reset()
-        else:
-            self.refresh_reference_library_index()
-            if 0 <= self.current_index < len(self.items):
-                self.update_reference_preview_for_item(self.items[self.current_index])
-            self.statusBar().showMessage("设置已保存并立即生效。", 4000)
+        self.log(f"设置已保存：{self.personality_profiles[self.active_personality_profile]['name']}")
+        self.statusBar().showMessage("设置已保存并立即生效。", 4000)
 
     def open_base_dir(self) -> None:
         if sys.platform.startswith("win"):
