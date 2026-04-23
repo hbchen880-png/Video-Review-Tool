@@ -31,9 +31,11 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QLayout,
     QLayoutItem,
+    QFrame,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSplitter,
@@ -48,6 +50,7 @@ SOURCE_DIR_NAME = "分镜生成"
 PASS_DIR_NAME = "审核通过"
 FAIL_DIR_NAME = "不合格视频"
 PRODUCT_LIBRARY_DIR_NAME = "产品库"
+PERSON_LIBRARY_DIR_NAME = "人物库"
 COPY_LIBRARY_DIR_NAME = "文案库"
 FINISHED_REPOSITORY_DIR_NAME = "成品仓库"
 CONFIG_FILE_NAME = "review_config.json"
@@ -776,6 +779,7 @@ class ReviewWindow(QMainWindow):
         self.pass_dir = self.base_dir / PASS_DIR_NAME
         self.fail_dir = self.base_dir / FAIL_DIR_NAME
         self.product_library_dir = self.base_dir / PRODUCT_LIBRARY_DIR_NAME
+        self.person_library_dir = self.base_dir / PERSON_LIBRARY_DIR_NAME
         self.rename_to_finished_repo = False
         self.playback_speed = 1.0
         self.available_review_groups: list[str] = []
@@ -792,14 +796,22 @@ class ReviewWindow(QMainWindow):
         self.reference_selection_map: dict[str, str] = {}
         self.reference_library_images: list[Path] = []
         self.reference_library_records: list[tuple[Path, str, str, str, str]] = []
+        self.person_reference_library_images: list[Path] = []
+        self.person_reference_library_records: list[tuple[Path, str, str, str, str]] = []
         self.reference_match_cache: dict[tuple[str, ...], tuple[str, list[Path]]] = {}
+        self.person_reference_match_cache: dict[tuple[str, ...], tuple[str, list[Path]]] = {}
         self.reference_pixmap_cache: dict[str, QPixmap] = {}
         self.reference_library_error_text = ""
+        self.person_reference_library_error_text = ""
         self.current_reference_product_key: Optional[str] = None
         self.current_reference_display_name = ""
         self.current_reference_images: list[Path] = []
         self.current_reference_index = -1
         self.reference_image_original_pixmap: Optional[QPixmap] = None
+        self.person_reference_match_cache: dict[tuple[str, ...], tuple[str, list[Path]]] = {}
+        self.current_person_reference_name = ""
+        self.current_person_reference_images: list[Path] = []
+        self.person_reference_image_original_pixmap: Optional[QPixmap] = None
 
         self.items: list[VideoItem] = []
         self.current_index = -1
@@ -842,6 +854,7 @@ class ReviewWindow(QMainWindow):
         self._resize_for_screen()
         self._apply_logo()
         self._build_ui()
+        self.adjust_reference_preview_sizes()
         self._build_player()
         self._bind_shortcuts()
         self.refresh_settings_display()
@@ -1060,39 +1073,92 @@ class ReviewWindow(QMainWindow):
         center_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         right_panel = QVBoxLayout()
+        right_panel.setContentsMargins(0, 0, 0, 0)
+        right_panel.setSpacing(8)
+
         right_title = QLabel("参考图片区")
         right_title.setStyleSheet("font-size:18px; font-weight:700;")
         self.reference_dir_label = QLabel()
         self.reference_dir_label.setWordWrap(True)
-        self.reference_dir_label.setStyleSheet("color:#666;")
-        self.reference_info = QLabel("未匹配到参考图")
+        self.reference_dir_label.setStyleSheet("color:#666; font-size:12px; line-height:1.35;")
+
+        person_title = QLabel("人物参考图")
+        person_title.setStyleSheet("font-size:15px; font-weight:700;")
+        self.person_reference_info = QLabel("未匹配到人物参考图")
+        self.person_reference_info.setWordWrap(True)
+        self.person_reference_info.setStyleSheet("color:#444; font-size:12px; line-height:1.35;")
+        self.person_reference_image_label = QLabel("暂无人物参考图")
+        self.person_reference_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.person_reference_image_label.setMinimumSize(220, 124)
+        self.person_reference_image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.person_reference_image_label.setStyleSheet("border:1px solid #ddd; border-radius:10px; background:#fafafa; color:#666;")
+
+        product_title = QLabel("产品参考图")
+        product_title.setStyleSheet("font-size:15px; font-weight:700;")
+        self.reference_info = QLabel("未匹配到产品参考图")
         self.reference_info.setWordWrap(True)
-        self.reference_info.setStyleSheet("color:#333;")
-        self.reference_image_label = QLabel("暂无参考图")
+        self.reference_info.setStyleSheet("color:#444; font-size:12px; line-height:1.35;")
+        self.reference_image_label = QLabel("暂无产品参考图")
         self.reference_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.reference_image_label.setMinimumSize(220, 260)
+        self.reference_image_label.setMinimumSize(220, 180)
+        self.reference_image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.reference_image_label.setStyleSheet("border:1px solid #ddd; border-radius:10px; background:#fafafa; color:#666;")
+
         self.reference_hint = QLabel()
         self.reference_hint.setWordWrap(True)
-        self.reference_hint.setStyleSheet("color:#666;")
+        self.reference_hint.setStyleSheet("color:#666; font-size:12px; line-height:1.35;")
         self.btn_cycle_reference = QPushButton()
+        self.btn_cycle_reference.setFixedHeight(28)
         self.btn_cycle_reference.clicked.connect(self.cycle_reference_image)
+
         log_title = QLabel("审核记录")
         log_title.setStyleSheet("font-size:16px; font-weight:700;")
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setPlaceholderText("这里会显示审核记录、裁剪结果与结束后的移动结果。")
-        right_panel.addWidget(right_title)
-        right_panel.addWidget(self.reference_dir_label)
-        right_panel.addWidget(self.reference_info)
-        right_panel.addWidget(self.reference_image_label, 3)
-        right_panel.addWidget(self.reference_hint)
-        right_panel.addWidget(self.btn_cycle_reference)
-        right_panel.addWidget(log_title)
-        right_panel.addWidget(self.log_text, 2)
+        self.log_text.setMinimumHeight(120)
+
+        def build_section(title_widget: QLabel, *widgets: QWidget) -> QFrame:
+            frame = QFrame()
+            frame.setStyleSheet("QFrame {border:1px solid #e3e3e3; border-radius:10px; background:#fcfcfc;}")
+            layout = QVBoxLayout(frame)
+            layout.setContentsMargins(10, 10, 10, 10)
+            layout.setSpacing(6)
+            layout.addWidget(title_widget)
+            for widget in widgets:
+                layout.addWidget(widget)
+            return frame
+
+        dir_frame = QFrame()
+        dir_frame.setStyleSheet("QFrame {border:1px solid #e3e3e3; border-radius:10px; background:#fcfcfc;}")
+        dir_layout = QVBoxLayout(dir_frame)
+        dir_layout.setContentsMargins(10, 10, 10, 10)
+        dir_layout.setSpacing(6)
+        dir_layout.addWidget(right_title)
+        dir_layout.addWidget(self.reference_dir_label)
+
+        person_frame = build_section(person_title, self.person_reference_info, self.person_reference_image_label)
+        product_frame = build_section(product_title, self.reference_info, self.reference_image_label, self.reference_hint, self.btn_cycle_reference)
+        log_frame = build_section(log_title, self.log_text)
+
+        right_panel.addWidget(dir_frame)
+        right_panel.addWidget(person_frame)
+        right_panel.addWidget(product_frame)
+        right_panel.addWidget(log_frame, 1)
+
+        right_scroll_body = QWidget()
+        right_scroll_body.setLayout(right_panel)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setWidget(right_scroll_body)
+
         right_container = QWidget()
-        right_container.setLayout(right_panel)
-        right_container.setMinimumWidth(220)
+        right_container_layout = QVBoxLayout(right_container)
+        right_container_layout.setContentsMargins(0, 0, 0, 0)
+        right_container_layout.addWidget(right_scroll)
+        right_container.setMinimumWidth(270)
         right_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         root_splitter.addWidget(left_container)
@@ -1542,9 +1608,11 @@ class ReviewWindow(QMainWindow):
 
     def refresh_settings_display(self) -> None:
         self.reference_dir_label.setText(
+            f"人物库目录：{self.person_library_dir}\n"
             f"产品库目录：{self.product_library_dir}\n"
             f"源目录：{self.source_dir}\n"
-            f"通过目录：{self.pass_dir}｜不通过目录：{self.fail_dir}"
+            f"通过目录：{self.pass_dir}\n"
+            f"不通过目录：{self.fail_dir}"
         )
         self.refresh_shortcut_texts()
         self.refresh_personality_profile_widgets()
@@ -2723,50 +2791,81 @@ class ReviewWindow(QMainWindow):
         self.log("重新加载目录并重置审核记录。")
         self._load_videos()
 
+    def detect_person_library_dir(self) -> Path:
+        candidates = [
+            self.product_library_dir.parent / PERSON_LIBRARY_DIR_NAME,
+            self.source_dir.parent / PERSON_LIBRARY_DIR_NAME,
+            self.base_dir / PERSON_LIBRARY_DIR_NAME,
+        ]
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            if self.safe_path_exists(candidate):
+                return candidate
+        return candidates[0]
+
+    def _build_reference_records_for_dir(self, base_dir: Path) -> tuple[list[Path], list[tuple[Path, str, str, str, str]], str]:
+        if not self.safe_path_exists(base_dir):
+            return [], [], ""
+        try:
+            images: list[Path] = []
+            records: list[tuple[Path, str, str, str, str]] = []
+            for path in base_dir.rglob("*"):
+                try:
+                    if path.is_file() and path.suffix.lower() in REFERENCE_IMAGE_EXTENSIONS:
+                        relative_text = self.safe_relative_text(path, base_dir)
+                        images.append(path)
+                        records.append((
+                            path,
+                            relative_text.lower(),
+                            self._normalize_reference_text(relative_text),
+                            self._normalize_reference_text(path.parent.name),
+                            self._normalize_reference_text(path.stem),
+                        ))
+                except OSError:
+                    continue
+            combined = sorted(zip(images, records), key=lambda row: row[1][1])
+            return [row[0] for row in combined], [row[1] for row in combined], ""
+        except OSError as exc:
+            return [], [], f"目录暂时无法访问：{base_dir}\n{exc}"
+
     def refresh_reference_library_index(self) -> None:
+        self.person_library_dir = self.detect_person_library_dir()
+
         self.reference_library_images = []
         self.reference_library_records = []
         self.reference_library_error_text = ""
         self.reference_match_cache.clear()
+
+        self.person_reference_library_images = []
+        self.person_reference_library_records = []
+        self.person_reference_library_error_text = ""
+        self.person_reference_match_cache.clear()
+
         self.reference_pixmap_cache.clear()
 
         access_error = self.get_product_library_access_error()
         if access_error:
             self.reference_library_error_text = access_error
-            return
+        else:
+            images, records, error_text = self._build_reference_records_for_dir(self.product_library_dir)
+            self.reference_library_images = images
+            self.reference_library_records = records
+            self.reference_library_error_text = error_text
 
-        if not self.safe_path_exists(self.product_library_dir):
-            return
-
-        try:
-            images: list[Path] = []
-            records: list[tuple[Path, str, str, str, str]] = []
-            for path in self.product_library_dir.rglob("*"):
-                try:
-                    if path.is_file() and path.suffix.lower() in REFERENCE_IMAGE_EXTENSIONS:
-                        relative_text = self.safe_relative_text(path, self.product_library_dir)
-                        images.append(path)
-                        records.append(
-                            (
-                                path,
-                                relative_text.lower(),
-                                self._normalize_reference_text(relative_text),
-                                self._normalize_reference_text(path.parent.name),
-                                self._normalize_reference_text(path.stem),
-                            )
-                        )
-                except OSError:
-                    continue
-            combined = sorted(
-                zip(images, records),
-                key=lambda row: row[1][1],
-            )
-            self.reference_library_images = [row[0] for row in combined]
-            self.reference_library_records = [row[1] for row in combined]
-        except OSError as exc:
-            self.reference_library_images = []
-            self.reference_library_records = []
-            self.reference_library_error_text = f"产品库目录暂时无法访问：{self.product_library_dir}\n{exc}"
+        person_issue = self.describe_path_issue(self.person_library_dir, "人物库目录")
+        if person_issue.startswith("未找到"):
+            person_issue = ""
+        if person_issue:
+            self.person_reference_library_error_text = person_issue
+        else:
+            images, records, error_text = self._build_reference_records_for_dir(self.person_library_dir)
+            self.person_reference_library_images = images
+            self.person_reference_library_records = records
+            self.person_reference_library_error_text = error_text
 
     def clear_reference_preview(self, info_text: str) -> None:
         self.current_reference_product_key = None
@@ -2775,8 +2874,16 @@ class ReviewWindow(QMainWindow):
         self.current_reference_index = -1
         self.reference_image_original_pixmap = None
         self.reference_info.setText(info_text)
-        self.reference_image_label.setText("暂无参考图")
+        self.reference_image_label.setText("暂无产品参考图")
         self.reference_image_label.setPixmap(QPixmap())
+
+    def clear_person_reference_preview(self, info_text: str) -> None:
+        self.current_person_reference_name = ""
+        self.current_person_reference_images = []
+        self.person_reference_image_original_pixmap = None
+        self.person_reference_info.setText(info_text)
+        self.person_reference_image_label.setText("暂无人物参考图")
+        self.person_reference_image_label.setPixmap(QPixmap())
 
     @staticmethod
     def _normalize_reference_text(value: str) -> str:
@@ -2833,19 +2940,56 @@ class ReviewWindow(QMainWindow):
 
         return candidates
 
-    def find_reference_images_for_item(self, item: VideoItem) -> tuple[str, list[Path]]:
-        if not self.reference_library_records:
-            return self.derive_product_key(item), []
+    def derive_person_reference_candidates(self, item: VideoItem) -> list[str]:
+        raw_names: list[str] = []
+        relative_parts = item.relative_path.parts
+        if len(relative_parts) >= 2:
+            raw_names.append(relative_parts[0])
+            raw_names.append(item.relative_path.parent.name)
+        else:
+            raw_names.append(item.source_path.stem)
 
-        candidates = self.derive_reference_candidates(item)
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add_candidate(name: str) -> None:
+            cleaned = name.strip().strip("/\\")
+            if not cleaned:
+                return
+            normalized = self._normalize_reference_text(cleaned)
+            if not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            candidates.append(cleaned)
+
+        for raw_name in raw_names:
+            parts = self._split_reference_tokens(raw_name)
+            if len(parts) >= 3:
+                add_candidate("-".join(parts[2:]))
+                add_candidate(parts[2])
+                add_candidate(parts[-1])
+            elif len(parts) >= 2:
+                add_candidate(parts[-1])
+
+        return candidates
+
+    def _find_library_images_by_candidates(
+        self,
+        candidates: list[str],
+        default_key: str,
+        cache: dict[tuple[str, ...], tuple[str, list[Path]]],
+    ) -> tuple[str, list[Path]]:
+        if not self.reference_library_records:
+            return default_key, []
+
         candidate_pairs = [
             (candidate, self._normalize_reference_text(candidate))
             for candidate in candidates
             if self._normalize_reference_text(candidate)
         ]
         cache_key = tuple(candidate_norm for _, candidate_norm in candidate_pairs)
-        if cache_key in self.reference_match_cache:
-            return self.reference_match_cache[cache_key]
+        if cache_key in cache:
+            return cache[cache_key]
 
         scored: list[tuple[int, str, Path]] = []
         for image_path, relative_text_lower, path_norm, parent_norm, stem_norm in self.reference_library_records:
@@ -2863,24 +3007,81 @@ class ReviewWindow(QMainWindow):
                 scored.append((score, relative_text_lower, image_path))
 
         if not scored:
-            result = (self.derive_product_key(item), [])
-            self.reference_match_cache[cache_key] = result
+            result = (default_key, [])
+            cache[cache_key] = result
             return result
 
         scored.sort(key=lambda row: (-row[0], row[1]))
         images = [row[2] for row in scored]
-        product_key = self.derive_product_key(item)
+        display_key = default_key
         for candidate, candidate_norm in candidate_pairs:
             if any(
                 candidate_norm in self._normalize_reference_text(path.parent.name)
                 or candidate_norm == self._normalize_reference_text(path.parent.name)
+                or candidate_norm == self._normalize_reference_text(path.stem)
                 for path in images
             ):
-                product_key = candidate
+                display_key = candidate
                 break
-        result = (product_key, images)
-        self.reference_match_cache[cache_key] = result
+        result = (display_key, images)
+        cache[cache_key] = result
         return result
+
+    def find_person_reference_images_for_item(self, item: VideoItem) -> tuple[str, list[Path]]:
+        candidates = self.derive_person_reference_candidates(item)
+        default_key = candidates[0] if candidates else "人物"
+        if not self.person_reference_library_records:
+            return default_key, []
+
+        candidate_pairs = [
+            (candidate, self._normalize_reference_text(candidate))
+            for candidate in candidates
+            if self._normalize_reference_text(candidate)
+        ]
+        cache_key = tuple(candidate_norm for _, candidate_norm in candidate_pairs)
+        if cache_key in self.person_reference_match_cache:
+            return self.person_reference_match_cache[cache_key]
+
+        scored: list[tuple[int, str, Path]] = []
+        for image_path, relative_text_lower, path_norm, parent_norm, stem_norm in self.person_reference_library_records:
+            score = 0
+            for candidate, candidate_norm in candidate_pairs:
+                if parent_norm == candidate_norm:
+                    score = max(score, 120)
+                elif stem_norm == candidate_norm:
+                    score = max(score, 100)
+                elif candidate_norm in parent_norm:
+                    score = max(score, 80)
+                elif candidate_norm in path_norm:
+                    score = max(score, 60)
+            if score > 0:
+                scored.append((score, relative_text_lower, image_path))
+
+        if not scored:
+            result = (default_key, [])
+            self.person_reference_match_cache[cache_key] = result
+            return result
+
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        images = [row[2] for row in scored]
+        person_key = default_key
+        for candidate, candidate_norm in candidate_pairs:
+            if any(
+                candidate_norm in self._normalize_reference_text(path.parent.name)
+                or candidate_norm == self._normalize_reference_text(path.parent.name)
+                or candidate_norm == self._normalize_reference_text(path.stem)
+                for path in images
+            ):
+                person_key = candidate
+                break
+        result = (person_key, images)
+        self.person_reference_match_cache[cache_key] = result
+        return result
+
+    def find_reference_images_for_item(self, item: VideoItem) -> tuple[str, list[Path]]:
+        candidates = self.derive_reference_candidates(item)
+        default_key = self.derive_product_key(item)
+        return self._find_library_images_by_candidates(candidates, default_key, self.reference_match_cache)
 
     def get_saved_reference_index(self, product_key: str, images: list[Path]) -> int:
         saved_path = self.reference_selection_map.get(product_key, "")
@@ -2903,21 +3104,95 @@ class ReviewWindow(QMainWindow):
         if not pixmap.isNull():
             self.reference_pixmap_cache[cache_key] = pixmap
 
-    def render_reference_pixmap(self) -> None:
-        if self.reference_image_original_pixmap is None or self.reference_image_original_pixmap.isNull():
+    def render_pixmap_to_label(self, label: QLabel, pixmap: Optional[QPixmap], padding: int = 12) -> None:
+        if pixmap is None or pixmap.isNull():
             return
-        target_size = self.reference_image_label.size()
-        scaled = self.reference_image_original_pixmap.scaled(
-            max(1, target_size.width() - 12),
-            max(1, target_size.height() - 12),
+        target_size = label.size()
+        scaled = pixmap.scaled(
+            max(1, target_size.width() - padding),
+            max(1, target_size.height() - padding),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        self.reference_image_label.setPixmap(scaled)
+        label.setPixmap(scaled)
+
+    def adjust_reference_preview_sizes(self) -> None:
+        if hasattr(self, "person_reference_image_label"):
+            width = max(220, self.person_reference_image_label.width())
+            height = max(124, int(width * 9 / 16))
+            self.person_reference_image_label.setMinimumHeight(height)
+            self.person_reference_image_label.setMaximumHeight(height)
+        if hasattr(self, "reference_image_label"):
+            width = max(220, self.reference_image_label.width())
+            height = max(180, min(280, int(width * 0.88)))
+            self.reference_image_label.setMinimumHeight(height)
+            self.reference_image_label.setMaximumHeight(height)
+
+    def render_person_reference_pixmap(self) -> None:
+        self.render_pixmap_to_label(self.person_reference_image_label, self.person_reference_image_original_pixmap)
+
+    def render_reference_pixmap(self) -> None:
+        self.render_pixmap_to_label(self.reference_image_label, self.reference_image_original_pixmap)
+
+    def update_person_reference_preview_for_item(self, item: VideoItem) -> None:
+        person_issue = self.describe_path_issue(self.person_library_dir, "人物库目录")
+        if person_issue.startswith("未找到"):
+            person_issue = ""
+        if person_issue:
+            self.clear_person_reference_preview(person_issue)
+            return
+        if not self.safe_path_exists(self.person_library_dir):
+            self.clear_person_reference_preview(f"未找到人物库目录：{self.person_library_dir}")
+            return
+        if self.person_reference_library_error_text:
+            self.clear_person_reference_preview(self.person_reference_library_error_text)
+            return
+
+        person_key, images = self.find_person_reference_images_for_item(item)
+        self.current_person_reference_name = person_key
+        self.current_person_reference_images = images
+
+        if not images:
+            self.person_reference_image_original_pixmap = None
+            self.person_reference_image_label.setPixmap(QPixmap())
+            self.person_reference_image_label.setText("暂无人物参考图")
+            self.person_reference_info.setText(
+                f"当前人物：{person_key}\n未在人物库中匹配到人物参考图。"
+            )
+            return
+
+        image_path = images[0]
+        cache_key = str(image_path)
+        pixmap = self.reference_pixmap_cache.get(cache_key)
+        if pixmap is None or pixmap.isNull():
+            pixmap = QPixmap(str(image_path))
+            if not pixmap.isNull():
+                self.reference_pixmap_cache[cache_key] = pixmap
+        if pixmap.isNull():
+            self.person_reference_image_original_pixmap = None
+            self.person_reference_image_label.setPixmap(QPixmap())
+            self.person_reference_image_label.setText("图片加载失败")
+            self.person_reference_info.setText(f"人物参考图加载失败：{image_path}")
+            return
+
+        relative_path = image_path
+        if self.safe_path_exists(self.person_library_dir):
+            try:
+                relative_path = image_path.relative_to(self.person_library_dir)
+            except ValueError:
+                pass
+
+        self.person_reference_image_original_pixmap = pixmap
+        self.person_reference_image_label.setText("")
+        self.render_person_reference_pixmap()
+        self.person_reference_info.setText(
+            f"当前人物：{person_key}\n"
+            f"文件：{relative_path}"
+        )
 
     def set_reference_image_by_index(self, index: int, persist: bool) -> None:
         if not self.current_reference_images:
-            self.clear_reference_preview("未匹配到参考图")
+            self.clear_reference_preview("未匹配到产品参考图")
             return
         index %= len(self.current_reference_images)
         image_path = self.current_reference_images[index]
@@ -2931,7 +3206,7 @@ class ReviewWindow(QMainWindow):
             self.reference_image_original_pixmap = None
             self.reference_image_label.setPixmap(QPixmap())
             self.reference_image_label.setText("图片加载失败")
-            self.reference_info.setText(f"参考图加载失败：{image_path}")
+            self.reference_info.setText(f"产品参考图加载失败：{image_path}")
             return
 
         self.current_reference_index = index
@@ -2957,6 +3232,8 @@ class ReviewWindow(QMainWindow):
             self.save_config()
 
     def update_reference_preview_for_item(self, item: VideoItem) -> None:
+        self.update_person_reference_preview_for_item(item)
+
         access_error = self.get_product_library_access_error()
         if access_error:
             self.clear_reference_preview(access_error)
@@ -2977,9 +3254,9 @@ class ReviewWindow(QMainWindow):
             self.current_reference_index = -1
             self.reference_image_original_pixmap = None
             self.reference_image_label.setPixmap(QPixmap())
-            self.reference_image_label.setText("暂无参考图")
+            self.reference_image_label.setText("暂无产品参考图")
             self.reference_info.setText(
-                f"当前产品：{product_key}\n未在产品库中匹配到参考图。"
+                f"当前产品：{product_key}\n未在产品库中匹配到产品参考图。"
             )
             return
 
@@ -3001,6 +3278,8 @@ class ReviewWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        self.adjust_reference_preview_sizes()
+        self.render_person_reference_pixmap()
         self.render_reference_pixmap()
 
     def open_settings_dialog(self) -> None:
